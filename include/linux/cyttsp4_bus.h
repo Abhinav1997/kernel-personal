@@ -8,6 +8,7 @@
  *
  * Copyright (C) 2012 Cypress Semiconductor
  * Copyright (C) 2011 Sony Ericsson Mobile Communications AB.
+ * Copyright (C) 2014 Sony Mobile Communications AB.
  *
  * Author: Aleksej Makarov <aleksej.makarov@sonyericsson.com>
  * Modified by: Cypress Semiconductor to add device functions
@@ -28,6 +29,8 @@
  *
  * Contact Cypress Semiconductor at www.cypress.com <ttdrivers@cypress.com>
  *
+ * NOTE: This file has been modified by Sony Mobile Communications AB.
+ * Modifications are licensed under the License.
  */
 
 #ifndef _LINUX_CYTTSP4_BUS_H
@@ -50,36 +53,26 @@ enum cyttsp4_atten_type {
 	CY_ATTEN_IRQ,
 	CY_ATTEN_STARTUP,
 	CY_ATTEN_EXCLUSIVE,
-	CY_ATTEN_WAKE,
 	CY_ATTEN_NUM_ATTEN,
 };
 
 typedef int (*cyttsp4_atten_func) (struct cyttsp4_device *);
 
 struct cyttsp4_ops {
-	int (*write)(struct cyttsp4_adapter *dev, u16 addr,
-		const void *buf, int size, int max_xfer);
-	int (*read)(struct cyttsp4_adapter *dev, u16 addr, void *buf,
-		int size, int max_xfer);
+	int (*write)(struct cyttsp4_adapter *dev, u8 addr,
+		const void *buf, int size);
+	int (*read)(struct cyttsp4_adapter *dev, u8 addr, void *buf, int size);
 };
 
 struct cyttsp4_adapter {
 	struct list_head node;
 	char id[NAME_MAX];
 	struct device *dev;
-	int (*write)(struct cyttsp4_adapter *dev, u16 addr,
-		const void *buf, int size, int max_xfer);
-	int (*read)(struct cyttsp4_adapter *dev, u16 addr, void *buf,
-		int size, int max_xfer);
+	int (*write)(struct cyttsp4_adapter *dev, u8 addr,
+		const void *buf, int size);
+	int (*read)(struct cyttsp4_adapter *dev, u8 addr, void *buf, int size);
 };
 #define to_cyttsp4_adapter(d) container_of(d, struct cyttsp4_adapter, dev)
-
-struct cyttsp4_core_info {
-	char const *name;
-	char const *id;
-	char const *adap_id;
-	void *platform_data;
-};
 
 struct cyttsp4_core {
 	struct list_head node;
@@ -91,20 +84,12 @@ struct cyttsp4_core {
 };
 #define to_cyttsp4_core(d) container_of(d, struct cyttsp4_core, dev)
 
-struct cyttsp4_device_info {
-	char const *name;
-	char const *core_id;
-	void *platform_data;
-};
-
 struct cyttsp4_device {
 	struct list_head node;
 	char const *name;
 	char const *core_id;
 	struct device dev;
 	struct cyttsp4_core *core;
-	int	upgrade_step;
-	bool	upgrade_now;
 };
 #define to_cyttsp4_device(d) container_of(d, struct cyttsp4_device, dev)
 
@@ -120,35 +105,24 @@ struct cyttsp4_core_driver {
 				enum cyttsp4_atten_type type,
 				cyttsp4_atten_func func,
 				int flags);
-	int (*request_exclusive)(struct cyttsp4_device *ttsp, int timeout_ms);
+	int (*request_exclusive)(struct cyttsp4_device *ttsp, int t);
 	int (*release_exclusive)(struct cyttsp4_device *ttsp);
 	int (*request_reset)(struct cyttsp4_device *ttsp);
-	int (*request_restart)(struct cyttsp4_device *ttsp, bool wait);
+	int (*request_restart)(struct cyttsp4_device *ttsp);
 	int (*request_set_mode)(struct cyttsp4_device *ttsp, int mode);
 	struct cyttsp4_sysinfo *(*request_sysinfo)(struct cyttsp4_device *ttsp);
-	struct cyttsp4_loader_platform_data
-		*(*request_loader_pdata)(struct cyttsp4_device *ttsp);
 	int (*request_handshake)(struct cyttsp4_device *ttsp, u8 mode);
 	int (*request_exec_cmd)(struct cyttsp4_device *ttsp, u8 mode,
 			u8 *cmd_buf, size_t cmd_size, u8 *return_buf,
-			size_t return_buf_size, int timeout_ms);
+			size_t return_buf_size, int timeout);
 	int (*request_stop_wd)(struct cyttsp4_device *ttsp);
 	int (*request_toggle_lowpower)(struct cyttsp4_device *ttsp, u8 mode);
-	int (*request_config_row_size)(struct cyttsp4_device *ttsp,
-			u16 *config_row_size);
-	int (*request_write_config)(struct cyttsp4_device *ttsp, u8 ebid,
-			u16 offset, u8 *data, u16 length);
-	int (*request_enable_scan_type)(struct cyttsp4_device *ttsp,
-			u8 scan_type);
-	int (*request_disable_scan_type)(struct cyttsp4_device *ttsp,
-			u8 scan_type);
-	const u8 *(*get_security_key)(struct cyttsp4_device *ttsp, int *size);
-	void (*get_touch_record)(struct cyttsp4_device *ttsp, int rec_no,
-			int *rec_abs);
+	int (*request_calibration)(struct cyttsp4_device *ttsp,
+			u16 old_config_ver);
 	int (*write)(struct cyttsp4_device *ttsp, int mode,
-		u16 addr, const void *buf, int size);
+		u8 addr, const void *buf, int size);
 	int (*read)(struct cyttsp4_device *ttsp, int mode,
-		u16 addr, void *buf, int size);
+		u8 addr, void *buf, int size);
 };
 #define to_cyttsp4_core_driver(d) \
 	container_of(d, struct cyttsp4_core_driver, driver)
@@ -166,18 +140,17 @@ extern void cyttsp4_unregister_driver(struct cyttsp4_driver *drv);
 extern int cyttsp4_register_core_driver(struct cyttsp4_core_driver *drv);
 extern void cyttsp4_unregister_core_driver(struct cyttsp4_core_driver *drv);
 
-extern int cyttsp4_register_device(struct cyttsp4_device_info const *dev_info);
-extern int cyttsp4_unregister_device(char const *name, char const *core_id);
+extern int cyttsp4_register_device(struct cyttsp4_device *pdev);
+extern void cyttsp4_unregister_device(struct cyttsp4_device *pdev);
 
-extern int cyttsp4_register_core_device(
-		struct cyttsp4_core_info const *core_info);
+extern int cyttsp4_register_core_device(struct cyttsp4_core *pdev);
 
 extern int cyttsp4_add_adapter(char const *id, struct cyttsp4_ops const *ops,
 		struct device *parent);
 
 extern int cyttsp4_del_adapter(char const *id);
 
-static inline int cyttsp4_read(struct cyttsp4_device *ttsp, int mode, u16 addr,
+static inline int cyttsp4_read(struct cyttsp4_device *ttsp, int mode, u8 addr,
 		void *buf, int size)
 {
 	struct cyttsp4_core *cd = ttsp->core;
@@ -185,12 +158,24 @@ static inline int cyttsp4_read(struct cyttsp4_device *ttsp, int mode, u16 addr,
 	return d->read(ttsp, mode, addr, buf, size);
 }
 
-static inline int cyttsp4_write(struct cyttsp4_device *ttsp, int mode, u16 addr,
+static inline int cyttsp4_write(struct cyttsp4_device *ttsp, int mode, u8 addr,
 		const void *buf, int size)
 {
 	struct cyttsp4_core *cd = ttsp->core;
 	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
 	return d->write(ttsp, mode, addr, buf, size);
+}
+
+static inline int cyttsp4_adap_read(struct cyttsp4_adapter *adap, u8 addr,
+		void *buf, int size)
+{
+	return adap->read(adap, addr, buf, size);
+}
+
+static inline int cyttsp4_adap_write(struct cyttsp4_adapter *adap, u8 addr,
+		const void *buf, int size)
+{
+	return adap->write(adap, addr, buf, size);
 }
 
 static inline int cyttsp4_subscribe_attention(struct cyttsp4_device *ttsp,
@@ -211,12 +196,11 @@ static inline int cyttsp4_unsubscribe_attention(struct cyttsp4_device *ttsp,
 	return d->unsubscribe_attention(ttsp, type, func, flags);
 }
 
-static inline int cyttsp4_request_exclusive(struct cyttsp4_device *ttsp,
-		int timeout_ms)
+static inline int cyttsp4_request_exclusive(struct cyttsp4_device *ttsp, int t)
 {
 	struct cyttsp4_core *cd = ttsp->core;
 	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	return d->request_exclusive(ttsp, timeout_ms);
+	return d->request_exclusive(ttsp, t);
 }
 
 static inline int cyttsp4_release_exclusive(struct cyttsp4_device *ttsp)
@@ -233,12 +217,11 @@ static inline int cyttsp4_request_reset(struct cyttsp4_device *ttsp)
 	return d->request_reset(ttsp);
 }
 
-static inline int cyttsp4_request_restart(struct cyttsp4_device *ttsp,
-		bool wait)
+static inline int cyttsp4_request_restart(struct cyttsp4_device *ttsp)
 {
 	struct cyttsp4_core *cd = ttsp->core;
 	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	return d->request_restart(ttsp, wait);
+	return d->request_restart(ttsp);
 }
 
 static inline int cyttsp4_request_set_mode(struct cyttsp4_device *ttsp,
@@ -257,14 +240,6 @@ static inline struct cyttsp4_sysinfo *cyttsp4_request_sysinfo(
 	return d->request_sysinfo(ttsp);
 }
 
-static inline struct cyttsp4_loader_platform_data *cyttsp4_request_loader_pdata(
-		struct cyttsp4_device *ttsp)
-{
-	struct cyttsp4_core *cd = ttsp->core;
-	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	return d->request_loader_pdata(ttsp);
-}
-
 static inline int cyttsp4_request_handshake(struct cyttsp4_device *ttsp,
 		u8 mode)
 {
@@ -275,12 +250,12 @@ static inline int cyttsp4_request_handshake(struct cyttsp4_device *ttsp,
 
 static inline int cyttsp4_request_exec_cmd(struct cyttsp4_device *ttsp,
 		u8 mode, u8 *cmd_buf, size_t cmd_size, u8 *return_buf,
-		size_t return_buf_size, int timeout_ms)
+		size_t return_buf_size, int timeout)
 {
 	struct cyttsp4_core *cd = ttsp->core;
 	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
 	return d->request_exec_cmd(ttsp, mode, cmd_buf, cmd_size, return_buf,
-			return_buf_size, timeout_ms);
+			return_buf_size, timeout);
 }
 
 static inline int cyttsp4_request_stop_wd(struct cyttsp4_device *ttsp)
@@ -298,51 +273,12 @@ static inline int cyttsp4_request_toggle_lowpower(struct cyttsp4_device *ttsp,
 	return d->request_toggle_lowpower(ttsp, mode);
 }
 
-static inline int cyttsp4_request_config_row_size(struct cyttsp4_device *ttsp,
-		u16 *config_row_size)
+static inline int cyttsp4_request_calibration(struct cyttsp4_device *ttsp,
+		u16 old_config_ver)
 {
 	struct cyttsp4_core *cd = ttsp->core;
 	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	return d->request_config_row_size(ttsp, config_row_size);
+	return d->request_calibration(ttsp, old_config_ver);
 }
 
-static inline int cyttsp4_request_write_config(struct cyttsp4_device *ttsp,
-		u8 ebid, u16 offset, u8 *data, u16 length)
-{
-	struct cyttsp4_core *cd = ttsp->core;
-	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	return d->request_write_config(ttsp, ebid, offset, data, length);
-}
-
-static inline int cyttsp4_request_enable_scan_type(struct cyttsp4_device *ttsp,
-		u8 scan_type)
-{
-	struct cyttsp4_core *cd = ttsp->core;
-	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	return d->request_enable_scan_type(ttsp, scan_type);
-}
-
-static inline int cyttsp4_request_disable_scan_type(struct cyttsp4_device *ttsp,
-		u8 scan_type)
-{
-	struct cyttsp4_core *cd = ttsp->core;
-	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	return d->request_disable_scan_type(ttsp, scan_type);
-}
-
-static inline const u8 *cyttsp4_get_security_key(struct cyttsp4_device *ttsp,
-		int *size)
-{
-	struct cyttsp4_core *cd = ttsp->core;
-	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	return d->get_security_key(ttsp, size);
-}
-
-static inline void cyttsp4_get_touch_record(struct cyttsp4_device *ttsp,
-		int rec_no, int *rec_abs)
-{
-	struct cyttsp4_core *cd = ttsp->core;
-	struct cyttsp4_core_driver *d = to_cyttsp4_core_driver(cd->dev.driver);
-	d->get_touch_record(ttsp, rec_no, rec_abs);
-}
 #endif /* _LINUX_CYTTSP4_BUS_H */

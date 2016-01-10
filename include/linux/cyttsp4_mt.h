@@ -8,6 +8,7 @@
  *
  * Copyright (C) 2012 Cypress Semiconductor
  * Copyright (C) 2011 Sony Ericsson Mobile Communications AB.
+ * Copyright (C) 2014 Sony Mobile Communications AB.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -25,6 +26,8 @@
  *
  * Contact Cypress Semiconductor at www.cypress.com <ttdrivers@cypress.com>
  *
+ * NOTE: This file has been modified by Sony Mobile Communications AB.
+ * Modifications are licensed under the License.
  */
 
 #ifndef _LINUX_CYTTSP4_MT_H
@@ -57,16 +60,6 @@ enum cyttsp4_sig_ost {
 	CY_NUM_ABS_OST	/* number of abs signals */
 };
 
-enum cyttsp4_mt_platform_flags {
-	CY_MT_FLAG_NONE = 0x00,
-	CY_MT_FLAG_HOVER = 0x04,
-	CY_MT_FLAG_FLIP = 0x08,
-	CY_MT_FLAG_INV_X = 0x10,
-	CY_MT_FLAG_INV_Y = 0x20,
-	CY_MT_FLAG_VKEYS = 0x40,
-	CY_MT_FLAG_NO_TOUCH_ON_LO = 0x80,
-};
-
 struct touch_framework {
 	const uint16_t  *abs;
 	uint8_t         size;
@@ -77,8 +70,6 @@ struct cyttsp4_mt_platform_data {
 	struct touch_framework *frmwrk;
 	unsigned short flags;
 	char const *inp_dev_name;
-	int vkeys_x;
-	int vkeys_y;
 };
 
 #endif /* _LINUX_CYTTSP4_MT_H */

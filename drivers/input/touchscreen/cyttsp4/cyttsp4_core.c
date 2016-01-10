@@ -8,6 +8,7 @@
  *
  * Copyright (C) 2012 Cypress Semiconductor
  * Copyright (C) 2011 Sony Ericsson Mobile Communications AB.
+ * Copyright (C) 2013 Sony Mobile Communications AB.
  *
  * Author: Aleksej Makarov <aleksej.makarov@sonyericsson.com>
  * Modified by: Cypress Semiconductor to add device functions
@@ -28,11 +29,12 @@
  *
  * Contact Cypress Semiconductor at www.cypress.com <ttdrivers@cypress.com>
  *
+ * NOTE: This file has been modified by Sony Mobile Communications AB.
+ * Modifications are licensed under the License.
  */
 
 #include <linux/cyttsp4_bus.h>
 
-#include <asm/unaligned.h>
 #include <linux/delay.h>
 #include <linux/gpio.h>
 #include <linux/input.h>
@@ -47,81 +49,16 @@
 
 #include <linux/cyttsp4_core.h>
 #include "cyttsp4_regs.h"
+#include "cyttsp4_device_access.h"
 
-/* Timeout in ms. */
-#define CY_CORE_REQUEST_EXCLUSIVE_TIMEOUT	500
-#define CY_CORE_SLEEP_REQUEST_EXCLUSIVE_TIMEOUT	5000
-#define CY_CORE_WAIT_SYSINFO_MODE_TIMEOUT	2000
-#define CY_CORE_MODE_CHANGE_TIMEOUT		1000
-#define CY_CORE_RESET_AND_WAIT_TIMEOUT		500
-#define CY_CORE_WAKEUP_TIMEOUT			50
+#define CY_CORE_MODE_CHANGE_TIMEOUT		2000
+#define CY_CORE_RESET_AND_WAIT_TIMEOUT		1000
+#define CY_CORE_WAKEUP_TIMEOUT			1000
+#define CY_CORE_COMMAND_COMPLETE_TIMEOUT	1000
+#define CY_CORE_IDAC_CALIBRATION_TIMEOUT	5000
 
-#define CY_CORE_STARTUP_RETRY_COUNT		3
+#define CY_CORE_HANDSHAKE_ERROR_MAX		10
 
-#define CY_CMD_OP_GET_CRC_CMD_SZ		2
-#define CY_CMD_OP_GET_CRC_RET_SZ		3
-
-#define CY_OP_PARA_SCAN_TYPE			0xD0
-
-#define CY_CMD_OP_GET_PARA_CMD_SZ		2
-
-#define CY_CMD_OP_GET_PARA_RET_SZ		6
-
-#define CY_CMD_OP_SET_PARA_CMD_SZ		7
-
-#define CY_CMD_OP_SET_PARA_RET_SZ		2
-
-#define CY_OP_PARA_SCAN_TYPE_NORMAL		0
-
-#define CY_OP_PARA_SCAN_TYPE_SZ			1
-
-#define CY_OP_PARA_SCAN_TYPE_APAMC_MASK		(1<<7)
-
-#define CY_OP_PARA_SCAN_TYPE_GLOVE_MASK		(1<<3)
-
-#define IS_DEEP_SLEEP_CONFIGURED(x) \
-		((x) == 0 || (x) == 0xFF)
-
-#define IS_TMO(t)	((t) == 0)
-
-#define PUT_FIELD16(si, val, addr) \
-do { \
-	if (IS_LITTLEENDIAN((si)->si_ptrs.cydata->device_info)) \
-		put_unaligned_le16(val, addr); \
-	else \
-		put_unaligned_be16(val, addr); \
-} while (0)
-
-#define GET_FIELD16(si, addr) \
-({ \
-	u16 __val; \
-	if (IS_LITTLEENDIAN((si)->si_ptrs.cydata->device_info)) \
-		__val = get_unaligned_le16(addr); \
-	else \
-		__val = get_unaligned_be16(addr); \
-	__val; \
-})
-
-#define RETRY_OR_EXIT(retry_cnt, retry_label, exit_label) \
-do { \
-	if (retry_cnt) \
-		goto retry_label; \
-	goto exit_label; \
-} while (0)
-
-#define CY_CORE_BL_HOST_SYNC_BYTE                0xFF
-
-static const u8 security_key[] = {
-	0xA5, 0x01, 0x02, 0x03, 0xFF, 0xFE, 0xFD, 0x5A
-};
-
-static const u8 ldr_exit[] = {
-	0xFF, 0x01, 0x3B, 0x00, 0x00, 0x4F, 0x6D, 0x17
-};
-
-static const u8 ldr_err_app[] = {
-	0x01, 0x02, 0x00, 0x00, 0x55, 0xDD, 0x17
-};
 
 MODULE_FIRMWARE(CY_FW_FILE_NAME);
 
@@ -136,25 +73,6 @@ enum cyttsp4_sleep_state {
 	SS_WAKING,
 };
 
-enum cyttsp4_startup_state {
-	STARTUP_NONE,
-	STARTUP_QUEUED,
-	STARTUP_RUNNING,
-};
-
-enum cyttsp4_signal_disparity {
-	CY_SIGNAL_DISPARITY_NONE,
-	CY_SIGNAL_DISPARITY_SENSITIVITY,
-	CY_SIGNAL_DISPARITY_PROXIMITY,
-	CY_SIGNAL_DISPARITY_MAX,
-};
-
-enum cyttsp4_opmode {
-         OPMODE_NONE,
-         OPMODE_FINGER,
-         OPMODE_GLOVE,
-};
-
 struct cyttsp4_core_data {
 	struct device *dev;
 	struct cyttsp4_core *core;
@@ -163,37 +81,31 @@ struct cyttsp4_core_data {
 	struct mutex adap_lock;
 	enum cyttsp4_mode mode;
 	enum cyttsp4_sleep_state sleep_state;
-	enum cyttsp4_startup_state startup_state;
-	enum cyttsp4_opmode opmode;
 	int int_status;
 	int cmd_toggle;
 	spinlock_t spinlock;
 	struct cyttsp4_core_platform_data *pdata;
 	wait_queue_head_t wait_q;
+	wait_queue_head_t sleep_q;
 	int irq;
+	struct workqueue_struct *startup_work_q;
 	struct work_struct startup_work;
+	struct workqueue_struct *mode_change_work_q;
+	struct work_struct mode_change_work;
 	struct cyttsp4_sysinfo sysinfo;
 	void *exclusive_dev;
-	int exclusive_waits;
 	atomic_t ignore_irq;
 	bool irq_enabled;
 	bool irq_wake;
-	bool wake_initiated_by_device;
-	bool invalid_touch_app;
-	int max_xfer;
-	int apa_mc_en;
-	int glove_en;
-	int stylus_en;
-	int proximity_en;
-	u8 default_scantype;
-	u8 easy_wakeup_gesture;
-	unsigned int active_refresh_cycle_ms;
-	u8 heartbeat_count;
+	bool is_probe;
+	bool fw_updated;
+	u16 old_config_ver;
+	u8 scan_type;
 #ifdef VERBOSE_DEBUG
 	u8 pr_buf[CY_MAX_PRBUF_SIZE];
 #endif
-	struct work_struct watchdog_work;
-	struct timer_list watchdog_timer;
+	struct work_struct work;
+	struct timer_list timer;
 };
 
 struct atten_node {
@@ -202,9 +114,6 @@ struct atten_node {
 	struct cyttsp4_device *ttsp;
 	int mode;
 };
-
-static int _cyttsp4_put_device_into_deep_sleep(struct cyttsp4_core_data *cd,
-		u8 hst_mode_reg);
 
 static inline size_t merge_bytes(u8 high, u8 low)
 {
@@ -217,12 +126,7 @@ void cyttsp4_pr_buf(struct device *dev, u8 *pr_buf, u8 *dptr, int size,
 {
 	int i, k;
 	const char fmt[] = "%02X ";
-	int max;
-
-	if (!size)
-		return;
-
-	max = (CY_MAX_PRBUF_SIZE - 1) - sizeof(CY_PR_TRUNCATED);
+	int max = (CY_MAX_PRBUF_SIZE - 1) - sizeof(CY_PR_TRUNCATED);
 
 	pr_buf[0] = 0;
 	for (i = k = 0; i < size && k < max; i++, k += 3)
@@ -231,215 +135,38 @@ void cyttsp4_pr_buf(struct device *dev, u8 *pr_buf, u8 *dptr, int size,
 	dev_vdbg(dev, "%s:  %s[0..%d]=%s%s\n", __func__, data_name, size - 1,
 			pr_buf, size <= max ? "" : CY_PR_TRUNCATED);
 }
-EXPORT_SYMBOL_GPL(cyttsp4_pr_buf);
+EXPORT_SYMBOL(cyttsp4_pr_buf);
 #endif
 
-static inline int cyttsp4_adap_read(struct cyttsp4_core_data *cd, u16 addr,
-		void *buf, int size)
-{
-	return cd->core->adap->read(cd->core->adap, addr, buf, size,
-			cd->max_xfer);
-}
-
-static inline int cyttsp4_adap_write(struct cyttsp4_core_data *cd, u16 addr,
-		const void *buf, int size)
-{
-	return cd->core->adap->write(cd->core->adap, addr, buf, size,
-			cd->max_xfer);
-}
-
-/* cyttsp4_platform_detect_read()
- *
- * This function is passed to platform detect
- * function to perform a read operation
- */
-static int cyttsp4_platform_detect_read(struct device *dev, u16 addr,
-		void *buf, int size)
-{
-	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
-	return cd->core->adap->read(cd->core->adap, addr, buf, size,
-			cd->max_xfer);
-}
-
-static u16 cyttsp4_calc_partial_app_crc(const u8 *data, int size, u16 crc)
-{
-	int i, j;
-
-	for (i = 0; i < size; i++) {
-		crc ^= ((u16)data[i] << 8);
-		for (j = 8; j > 0; j--)
-			if (crc & 0x8000)
-				crc = (crc << 1) ^ 0x1021;
-			else
-				crc <<= 1;
-	}
-
-	return crc;
-}
-
-static inline u16 cyttsp4_calc_app_crc(const u8 *data, int size)
-{
-	return cyttsp4_calc_partial_app_crc(data, size, 0xFFFF);
-}
-
-static const u8 *cyttsp4_get_security_key_(struct cyttsp4_device *ttsp,
-		int *size)
-{
-	if (size)
-		*size = sizeof(security_key);
-
-	return security_key;
-}
-
-static inline void cyttsp4_get_touch_axis(struct cyttsp4_core_data *cd,
-		int *axis, int size, int max, u8 *xy_data, int bofs)
-{
-	int nbyte;
-	int next;
-
-	for (nbyte = 0, *axis = 0, next = 0; nbyte < size; nbyte++) {
-		dev_vdbg(cd->dev,
-			"%s: *axis=%02X(%d) size=%d max=%08X xy_data=%p"
-			" xy_data[%d]=%02X(%d) bofs=%d\n",
-			__func__, *axis, *axis, size, max, xy_data, next,
-			xy_data[next], xy_data[next], bofs);
-		*axis = (*axis * 256) + (xy_data[next] >> bofs);
-		next++;
-	}
-
-	*axis &= max - 1;
-
-	dev_vdbg(cd->dev,
-		"%s: *axis=%02X(%d) size=%d max=%08X xy_data=%p"
-		" xy_data[%d]=%02X(%d)\n",
-		__func__, *axis, *axis, size, max, xy_data, next,
-		xy_data[next], xy_data[next]);
-}
-
-/*
- * cyttsp4_get_touch_record_()
- *
- * Fills touch info for a touch record specified by rec_no
- * Should only be called in Operational mode IRQ attention and
- * rec_no should be less than the number of current touch records
- */
-static void cyttsp4_get_touch_record_(struct cyttsp4_device *ttsp,
-		int rec_no, int *rec_abs)
-{
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-	struct device *dev = cd->dev;
-	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	u8 *xy_data = si->xy_data + (rec_no * si->si_ofs.tch_rec_size);
-	enum cyttsp4_tch_abs abs;
-
-	memset(rec_abs, 0, CY_TCH_NUM_ABS * sizeof(int));
-	for (abs = CY_TCH_X; abs < CY_TCH_NUM_ABS; abs++) {
-		cyttsp4_get_touch_axis(cd, &rec_abs[abs],
-			si->si_ofs.tch_abs[abs].size,
-			si->si_ofs.tch_abs[abs].max,
-			xy_data + si->si_ofs.tch_abs[abs].ofs,
-			si->si_ofs.tch_abs[abs].bofs);
-		dev_vdbg(dev, "%s: get %s=%04X(%d)\n", __func__,
-			cyttsp4_tch_abs_string[abs],
-			rec_abs[abs], rec_abs[abs]);
-	}
-}
-
-static int cyttsp4_load_status_and_touch_regs(struct cyttsp4_core_data *cd,
-		bool optimize)
+static int cyttsp4_load_status_regs(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
 	struct device *dev = cd->dev;
-	int first_read_len;
-	int second_read_off;
-	int num_read_rec;
-	u8 num_cur_rec;
-	u8 hst_mode;
-	u8 rep_len;
-	u8 rep_stat;
-	u8 tt_stat;
 	int rc;
 
 	if (!si->xy_mode) {
-		dev_err(cd->dev, "%s: NULL xy_mode pointer\n",
-			__func__);
+		dev_err(cd->dev, "%s: NULL xy_mode pointer\n", __func__);
 		return -EINVAL;
 	}
 
-	first_read_len = si->si_ofs.rep_hdr_size;
-	/* Read one touch record additionally */
-	if (optimize)
-		first_read_len += si->si_ofs.tch_rec_size;
-
-	rc = cyttsp4_adap_read(cd, si->si_ofs.rep_ofs,
-			&si->xy_mode[si->si_ofs.rep_ofs], first_read_len);
-	if (rc < 0) {
+	rc = cyttsp4_adap_read(cd->core->adap, CY_REG_BASE,
+		si->xy_mode, si->si_ofs.mode_size);
+	if (rc < 0)
 		dev_err(dev, "%s: fail read mode regs r=%d\n",
 			__func__, rc);
-		return rc;
-	}
+	else
+		cyttsp4_pr_buf(dev, cd->pr_buf, si->xy_mode,
+			si->si_ofs.mode_size, "xy_mode");
 
-	/* print xy data */
-	cyttsp4_pr_buf(dev, cd->pr_buf, si->xy_mode,
-		si->si_ofs.mode_size, "xy_mode");
-
-	hst_mode = si->xy_mode[CY_REG_BASE];
-	rep_len = si->xy_mode[si->si_ofs.rep_ofs];
-	rep_stat = si->xy_mode[si->si_ofs.rep_ofs + 1];
-	tt_stat = si->xy_mode[si->si_ofs.tt_stat_ofs];
-	dev_vdbg(dev, "%s: %s%02X %s%d %s%02X %s%02X\n", __func__,
-		"hst_mode=", hst_mode, "rep_len=", rep_len,
-		"rep_stat=", rep_stat, "tt_stat=", tt_stat);
-
-	num_cur_rec = GET_NUM_TOUCH_RECORDS(tt_stat);
-	dev_vdbg(dev, "%s: num_cur_rec=%d\n", __func__, num_cur_rec);
-
-	if (rep_len == 0 && num_cur_rec > 0) {
-		dev_err(dev, "%s: report length error rep_len=%d num_rec=%d\n",
-			__func__, rep_len, num_cur_rec);
-		return -EIO;
-	}
-
-	num_read_rec = num_cur_rec;
-	second_read_off = si->si_ofs.tt_stat_ofs + 1;
-	if (optimize) {
-		num_read_rec--;
-		second_read_off += si->si_ofs.tch_rec_size;
-	}
-
-	if (num_read_rec <= 0)
-		goto exit_print;
-
-	rc = cyttsp4_adap_read(cd, second_read_off,
-			&si->xy_mode[second_read_off],
-			num_read_rec * si->si_ofs.tch_rec_size);
-	if (rc < 0) {
-		dev_err(dev, "%s: read fail on touch regs r=%d\n",
-			__func__, rc);
-		return rc;
-	}
-
-exit_print:
-	/* print xy data */
-	cyttsp4_pr_buf(dev, cd->pr_buf, si->xy_data,
-		num_cur_rec * si->si_ofs.tch_rec_size, "xy_data");
-
-	return 0;
+	return rc;
 }
 
 static int cyttsp4_handshake(struct cyttsp4_core_data *cd, u8 mode)
 {
 	u8 cmd = mode ^ CY_HST_TOGGLE;
-	int rc;
+	int rc = cyttsp4_adap_write(cd->core->adap, CY_REG_BASE, &cmd,
+			sizeof(cmd));
 
-	if (mode & CY_HST_MODE_CHANGE) {
-		dev_err(cd->dev, "%s: Host mode change bit set, NO handshake\n",
-				__func__);
-		return 0;
-	}
-
-	rc = cyttsp4_adap_write(cd, CY_REG_BASE, &cmd, sizeof(cmd));
 	if (rc < 0)
 		dev_err(cd->dev, "%s: bus write fail on handshake (ret=%d)\n",
 				__func__, rc);
@@ -447,34 +174,22 @@ static int cyttsp4_handshake(struct cyttsp4_core_data *cd, u8 mode)
 	return rc;
 }
 
-static int cyttsp4_toggle_low_power_(struct cyttsp4_core_data *cd, u8 mode)
-{
-	u8 cmd = mode ^ CY_HST_LOWPOW;
-
-	int rc = cyttsp4_adap_write(cd, CY_REG_BASE, &cmd, sizeof(cmd));
-	if (rc < 0)
-		dev_err(cd->dev,
-			"%s: bus write fail on toggle low power (ret=%d)\n",
-			__func__, rc);
-	return rc;
-}
-
 static int cyttsp4_toggle_low_power(struct cyttsp4_core_data *cd, u8 mode)
 {
-	int rc;
-
-	mutex_lock(&cd->system_lock);
-	rc = cyttsp4_toggle_low_power_(cd, mode);
-	mutex_unlock(&cd->system_lock);
-
+	u8 cmd = mode ^ CY_HST_LOWPOW;
+	int rc = cyttsp4_adap_write(cd->core->adap, CY_REG_BASE, &cmd,
+			sizeof(cmd));
+	if (rc < 0)
+		dev_err(cd->dev, "%s: bus write fail on toggle low power" \
+				" (ret=%d)\n", __func__, rc);
 	return rc;
 }
 
-static int cyttsp4_hw_soft_reset_(struct cyttsp4_core_data *cd)
+static int cyttsp4_hw_soft_reset(struct cyttsp4_core_data *cd)
 {
-	u8 cmd = CY_HST_RESET;
-
-	int rc = cyttsp4_adap_write(cd, CY_REG_BASE, &cmd, sizeof(cmd));
+	u8 cmd = CY_HST_RESET | CY_HST_MODE_CHANGE;
+	int rc = cyttsp4_adap_write(cd->core->adap, CY_REG_BASE, &cmd,
+			sizeof(cmd));
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: FAILED to execute SOFT reset\n",
 				__func__);
@@ -484,18 +199,7 @@ static int cyttsp4_hw_soft_reset_(struct cyttsp4_core_data *cd)
 	return 0;
 }
 
-static int cyttsp4_hw_soft_reset(struct cyttsp4_core_data *cd)
-{
-	int rc;
-
-	mutex_lock(&cd->system_lock);
-	rc = cyttsp4_hw_soft_reset_(cd);
-	mutex_unlock(&cd->system_lock);
-
-	return rc;
-}
-
-static int cyttsp4_hw_hard_reset_(struct cyttsp4_core_data *cd)
+static int cyttsp4_hw_hard_reset(struct cyttsp4_core_data *cd)
 {
 	if (cd->pdata->xres) {
 		cd->pdata->xres(cd->pdata, cd->dev);
@@ -506,26 +210,15 @@ static int cyttsp4_hw_hard_reset_(struct cyttsp4_core_data *cd)
 	return -ENOSYS;
 }
 
-static int cyttsp4_hw_hard_reset(struct cyttsp4_core_data *cd)
+static int cyttsp4_hw_reset(struct cyttsp4_core_data *cd)
 {
-	int rc;
-
-	mutex_lock(&cd->system_lock);
-	rc = cyttsp4_hw_hard_reset_(cd);
-	mutex_unlock(&cd->system_lock);
-
-	return rc;
-}
-
-static int cyttsp4_hw_reset_(struct cyttsp4_core_data *cd)
-{
-	int rc = cyttsp4_hw_hard_reset_(cd);
+	int rc = cyttsp4_hw_hard_reset(cd);
 	if (rc == -ENOSYS)
-		rc = cyttsp4_hw_soft_reset_(cd);
+		rc = cyttsp4_hw_soft_reset(cd);
 	return rc;
 }
 
-static inline int cyttsp4_bits_2_bytes(int nbits, size_t *max)
+static inline int cyttsp4_bits_2_bytes(int nbits, int *max)
 {
 	*max = 1 << nbits;
 	return (nbits + 7) / 8;
@@ -534,7 +227,7 @@ static inline int cyttsp4_bits_2_bytes(int nbits, size_t *max)
 static int cyttsp4_si_data_offsets(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	int rc = cyttsp4_adap_read(cd, CY_REG_BASE, &si->si_data,
+	int rc = cyttsp4_adap_read(cd->core->adap, CY_REG_BASE, &si->si_data,
 				   sizeof(si->si_data));
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: fail read sysinfo data offsets r=%d\n",
@@ -570,97 +263,44 @@ static int cyttsp4_si_data_offsets(struct cyttsp4_core_data *cd)
 static int cyttsp4_si_get_cydata(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	int read_offset;
-	int mfgid_sz, calc_mfgid_sz;
-	void *p;
 	int rc;
 
 	si->si_ofs.cydata_size = si->si_ofs.test_ofs - si->si_ofs.cydata_ofs;
-	dev_dbg(cd->dev, "%s: cydata size: %zu\n", __func__,
-			si->si_ofs.cydata_size);
-
-	if (si->si_ofs.cydata_size <= 0)
-		return -EINVAL;
-
-	p = krealloc(si->si_ptrs.cydata, si->si_ofs.cydata_size, GFP_KERNEL);
-	if (p == NULL) {
+	if (si->si_ptrs.cydata == NULL)
+		si->si_ptrs.cydata = kzalloc(si->si_ofs.cydata_size,
+			GFP_KERNEL);
+	if (si->si_ptrs.cydata == NULL) {
 		dev_err(cd->dev, "%s: fail alloc cydata memory\n", __func__);
 		return -ENOMEM;
 	}
-	si->si_ptrs.cydata = p;
 
-	read_offset = si->si_ofs.cydata_ofs;
-
-	/* Read the CYDA registers up to MFGID field */
-	rc = cyttsp4_adap_read(cd, read_offset, si->si_ptrs.cydata,
-			offsetof(struct cyttsp4_cydata, mfgid_sz)
-			+ sizeof(si->si_ptrs.cydata->mfgid_sz));
-	if (rc < 0) {
+	rc = cyttsp4_adap_read(cd->core->adap, si->si_ofs.cydata_ofs,
+			       si->si_ptrs.cydata, si->si_ofs.cydata_size);
+	if (rc < 0)
 		dev_err(cd->dev, "%s: fail read cydata r=%d\n",
 			__func__, rc);
-		return rc;
-	}
-
-	/* Check MFGID size */
-	mfgid_sz = si->si_ptrs.cydata->mfgid_sz;
-	calc_mfgid_sz = si->si_ofs.cydata_size - sizeof(struct cyttsp4_cydata);
-	if (mfgid_sz != calc_mfgid_sz) {
-		dev_err(cd->dev, "%s: mismatch in MFGID size, reported:%d calculated:%d\n",
-			__func__, mfgid_sz, calc_mfgid_sz);
-		return -EINVAL;
-	}
-
-	read_offset += offsetof(struct cyttsp4_cydata, mfgid_sz)
-			+ sizeof(si->si_ptrs.cydata->mfgid_sz);
-
-	/* Read the CYDA registers for MFGID field */
-	rc = cyttsp4_adap_read(cd, read_offset, si->si_ptrs.cydata->mfg_id,
-			si->si_ptrs.cydata->mfgid_sz);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: fail read cydata r=%d\n",
-			__func__, rc);
-		return rc;
-	}
-
-	read_offset += si->si_ptrs.cydata->mfgid_sz;
-
-	/* Read the rest of the CYDA registers */
-	rc = cyttsp4_adap_read(cd, read_offset, &si->si_ptrs.cydata->cyito_idh,
-			sizeof(struct cyttsp4_cydata)
-			- offsetof(struct cyttsp4_cydata, cyito_idh));
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: fail read cydata r=%d\n",
-			__func__, rc);
-		return rc;
-	}
-
-	cyttsp4_pr_buf(cd->dev, cd->pr_buf, (u8 *)si->si_ptrs.cydata,
-		si->si_ofs.cydata_size - mfgid_sz, "sysinfo_cydata");
-	cyttsp4_pr_buf(cd->dev, cd->pr_buf, si->si_ptrs.cydata->mfg_id,
-		mfgid_sz, "sysinfo_cydata_mfgid");
+	else
+		cyttsp4_pr_buf(cd->dev, cd->pr_buf,
+			       (u8 *)si->si_ptrs.cydata,
+			       si->si_ofs.cydata_size, "sysinfo_cydata");
 	return rc;
 }
 
 static int cyttsp4_si_get_test_data(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	void *p;
 	int rc;
 
 	si->si_ofs.test_size = si->si_ofs.pcfg_ofs - si->si_ofs.test_ofs;
-
-	if (si->si_ofs.test_size <= 0)
-		return -EINVAL;
-
-	p = krealloc(si->si_ptrs.test, si->si_ofs.test_size, GFP_KERNEL);
-	if (p == NULL) {
+	if (si->si_ptrs.test == NULL)
+		si->si_ptrs.test = kzalloc(si->si_ofs.test_size, GFP_KERNEL);
+	if (si->si_ptrs.test == NULL) {
 		dev_err(cd->dev, "%s: fail alloc test memory\n", __func__);
 		return -ENOMEM;
 	}
-	si->si_ptrs.test = p;
 
-	rc = cyttsp4_adap_read(cd, si->si_ofs.test_ofs, si->si_ptrs.test,
-			si->si_ofs.test_size);
+	rc = cyttsp4_adap_read(cd->core->adap, si->si_ofs.test_ofs,
+		si->si_ptrs.test, si->si_ofs.test_size);
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: fail read test data r=%d\n",
 			__func__, rc);
@@ -698,26 +338,18 @@ static int cyttsp4_si_get_test_data(struct cyttsp4_core_data *cd)
 static int cyttsp4_si_get_pcfg_data(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	void *p;
 	int rc;
 
 	dev_vdbg(cd->dev, "%s: get pcfg data\n", __func__);
 	si->si_ofs.pcfg_size = si->si_ofs.opcfg_ofs - si->si_ofs.pcfg_ofs;
-
-	if (si->si_ofs.pcfg_size <= 0)
-		return -EINVAL;
-
-	p = krealloc(si->si_ptrs.pcfg, si->si_ofs.pcfg_size, GFP_KERNEL);
-	if (p == NULL) {
-		rc = -ENOMEM;
-		dev_err(cd->dev, "%s: fail alloc pcfg memory r=%d\n",
-			__func__, rc);
-		return rc;
+	if (si->si_ptrs.pcfg == NULL)
+		si->si_ptrs.pcfg = kzalloc(si->si_ofs.pcfg_size, GFP_KERNEL);
+	if (si->si_ptrs.pcfg == NULL) {
+		dev_err(cd->dev, "%s: fail alloc pcfg memory\n", __func__);
+		return -ENOMEM;
 	}
-	si->si_ptrs.pcfg = p;
-
-	rc = cyttsp4_adap_read(cd, si->si_ofs.pcfg_ofs, si->si_ptrs.pcfg,
-			si->si_ofs.pcfg_size);
+	rc = cyttsp4_adap_read(cd->core->adap, si->si_ofs.pcfg_ofs,
+			       si->si_ptrs.pcfg, si->si_ofs.pcfg_size);
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: fail read pcfg data r=%d\n",
 			__func__, rc);
@@ -746,25 +378,19 @@ static int cyttsp4_si_get_opcfg_data(struct cyttsp4_core_data *cd)
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
 	int i;
 	enum cyttsp4_tch_abs abs;
-	void *p;
 	int rc;
 
 	dev_vdbg(cd->dev, "%s: get opcfg data\n", __func__);
 	si->si_ofs.opcfg_size = si->si_ofs.ddata_ofs - si->si_ofs.opcfg_ofs;
-
-	if (si->si_ofs.opcfg_size <= 0)
-		return -EINVAL;
-
-	p = krealloc(si->si_ptrs.opcfg, si->si_ofs.opcfg_size, GFP_KERNEL);
-	if (p == NULL) {
+	if (si->si_ptrs.opcfg == NULL)
+		si->si_ptrs.opcfg = kzalloc(si->si_ofs.opcfg_size, GFP_KERNEL);
+	if (si->si_ptrs.opcfg == NULL) {
 		dev_err(cd->dev, "%s: fail alloc opcfg memory\n", __func__);
-		rc = -ENOMEM;
-		goto cyttsp4_si_get_opcfg_data_exit;
+		return -ENOMEM;
 	}
-	si->si_ptrs.opcfg = p;
 
-	rc = cyttsp4_adap_read(cd, si->si_ofs.opcfg_ofs, si->si_ptrs.opcfg,
-			si->si_ofs.opcfg_size);
+	rc = cyttsp4_adap_read(cd->core->adap, si->si_ofs.opcfg_ofs,
+		si->si_ptrs.opcfg, si->si_ofs.opcfg_size);
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: fail read opcfg data r=%d\n",
 			__func__, rc);
@@ -803,7 +429,7 @@ static int cyttsp4_si_get_opcfg_data(struct cyttsp4_core_data *cd)
 	si->si_ofs.btn_diff_ofs = si->si_ptrs.opcfg->btn_diff_ofs;
 	si->si_ofs.btn_diff_size = si->si_ptrs.opcfg->btn_diff_size;
 
-	if (IS_TTSP_VER_GE(si, 2, 3)) {
+	if (si->si_ofs.tch_rec_size > CY_TMA1036_TCH_REC_SIZE) {
 		/* Get the extended touch fields */
 		for (i = 0; i < CY_NUM_EXT_TCH_FIELDS; abs++, i++) {
 			si->si_ofs.tch_abs[abs].ofs =
@@ -819,28 +445,22 @@ static int cyttsp4_si_get_opcfg_data(struct cyttsp4_core_data *cd)
 		}
 	}
 
-	if (IS_TTSP_VER_GE(si, 2, 4)) {
-		si->si_ofs.noise_data_ofs = si->si_ptrs.opcfg->noise_data_ofs;
-		si->si_ofs.noise_data_sz = si->si_ptrs.opcfg->noise_data_sz;
-	}
-
 	for (abs = 0; abs < CY_TCH_NUM_ABS; abs++) {
 		dev_dbg(cd->dev, "%s: tch_rec_%s\n", __func__,
 			cyttsp4_tch_abs_string[abs]);
-		dev_dbg(cd->dev, "%s:     ofs =%2zu\n", __func__,
+		dev_dbg(cd->dev, "%s:     ofs =%2d\n", __func__,
 			si->si_ofs.tch_abs[abs].ofs);
-		dev_dbg(cd->dev, "%s:     siz =%2zu\n", __func__,
+		dev_dbg(cd->dev, "%s:     siz =%2d\n", __func__,
 			si->si_ofs.tch_abs[abs].size);
-		dev_dbg(cd->dev, "%s:     max =%2zu\n", __func__,
+		dev_dbg(cd->dev, "%s:     max =%2d\n", __func__,
 			si->si_ofs.tch_abs[abs].max);
-		dev_dbg(cd->dev, "%s:     bofs=%2zu\n", __func__,
+		dev_dbg(cd->dev, "%s:     bofs=%2d\n", __func__,
 			si->si_ofs.tch_abs[abs].bofs);
 	}
 
 	si->si_ofs.mode_size = si->si_ofs.tt_stat_ofs + 1;
 	si->si_ofs.data_size = si->si_ofs.max_tchs *
 		si->si_ptrs.opcfg->tch_rec_size;
-	si->si_ofs.rep_hdr_size = si->si_ofs.mode_size - si->si_ofs.rep_ofs;
 
 	cyttsp4_pr_buf(cd->dev, cd->pr_buf, (u8 *)si->si_ptrs.opcfg,
 		si->si_ofs.opcfg_size, "sysinfo_opcfg_data");
@@ -852,24 +472,19 @@ cyttsp4_si_get_opcfg_data_exit:
 static int cyttsp4_si_get_ddata(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	void *p;
 	int rc;
 
 	dev_vdbg(cd->dev, "%s: get ddata data\n", __func__);
 	si->si_ofs.ddata_size = si->si_ofs.mdata_ofs - si->si_ofs.ddata_ofs;
-
-	if (si->si_ofs.ddata_size <= 0)
-		return -EINVAL;
-
-	p = krealloc(si->si_ptrs.ddata, si->si_ofs.ddata_size, GFP_KERNEL);
-	if (p == NULL) {
+	if (si->si_ptrs.ddata == NULL)
+		si->si_ptrs.ddata = kzalloc(si->si_ofs.ddata_size, GFP_KERNEL);
+	if (si->si_ptrs.ddata == NULL) {
 		dev_err(cd->dev, "%s: fail alloc ddata memory\n", __func__);
 		return -ENOMEM;
 	}
-	si->si_ptrs.ddata = p;
 
-	rc = cyttsp4_adap_read(cd, si->si_ofs.ddata_ofs, si->si_ptrs.ddata,
-			si->si_ofs.ddata_size);
+	rc = cyttsp4_adap_read(cd->core->adap, si->si_ofs.ddata_ofs,
+			       si->si_ptrs.ddata, si->si_ofs.ddata_size);
 	if (rc < 0)
 		dev_err(cd->dev, "%s: fail read ddata data r=%d\n",
 			__func__, rc);
@@ -883,24 +498,19 @@ static int cyttsp4_si_get_ddata(struct cyttsp4_core_data *cd)
 static int cyttsp4_si_get_mdata(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	void *p;
 	int rc;
 
 	dev_vdbg(cd->dev, "%s: get mdata data\n", __func__);
 	si->si_ofs.mdata_size = si->si_ofs.map_sz - si->si_ofs.mdata_ofs;
-
-	if (si->si_ofs.mdata_size <= 0)
-		return -EINVAL;
-
-	p = krealloc(si->si_ptrs.mdata, si->si_ofs.mdata_size, GFP_KERNEL);
-	if (p == NULL) {
+	if (si->si_ptrs.mdata == NULL)
+		si->si_ptrs.mdata = kzalloc(si->si_ofs.mdata_size, GFP_KERNEL);
+	if (si->si_ptrs.mdata == NULL) {
 		dev_err(cd->dev, "%s: fail alloc mdata memory\n", __func__);
 		return -ENOMEM;
 	}
-	si->si_ptrs.mdata = p;
 
-	rc = cyttsp4_adap_read(cd, si->si_ofs.mdata_ofs, si->si_ptrs.mdata,
-			si->si_ofs.mdata_size);
+	rc = cyttsp4_adap_read(cd->core->adap, si->si_ofs.mdata_ofs,
+			       si->si_ptrs.mdata, si->si_ofs.mdata_size);
 	if (rc < 0)
 		dev_err(cd->dev, "%s: fail read mdata data r=%d\n",
 			__func__, rc);
@@ -917,142 +527,137 @@ static int cyttsp4_si_get_btn_data(struct cyttsp4_core_data *cd)
 	int btn;
 	int num_defined_keys;
 	u16 *key_table;
-	void *p;
 	int rc = 0;
 
 	dev_vdbg(cd->dev, "%s: get btn data\n", __func__);
+	if (si->si_ofs.num_btns) {
+		si->si_ofs.btn_keys_size = si->si_ofs.num_btns *
+			sizeof(struct cyttsp4_btn);
+		if (si->btn == NULL)
+			si->btn = kzalloc(si->si_ofs.btn_keys_size, GFP_KERNEL);
+		if (si->btn == NULL) {
+			dev_err(cd->dev, "%s: %s\n", __func__,
+				"fail alloc btn_keys memory");
+			return -ENOMEM;
+		}
+		if (cd->pdata->sett[CY_IC_GRPNUM_BTN_KEYS] == NULL)
+			num_defined_keys = 0;
+		else if (cd->pdata->sett[CY_IC_GRPNUM_BTN_KEYS]->data == NULL)
+			num_defined_keys = 0;
+		else
+			num_defined_keys = cd->pdata->sett
+				[CY_IC_GRPNUM_BTN_KEYS]->size;
 
-	if (!si->si_ofs.num_btns) {
-		si->si_ofs.btn_keys_size = 0;
-		kfree(si->btn);
-		si->btn = NULL;
+		for (btn = 0; btn < si->si_ofs.num_btns &&
+			btn < num_defined_keys; btn++) {
+			key_table = (u16 *)cd->pdata->sett
+				[CY_IC_GRPNUM_BTN_KEYS]->data;
+			si->btn[btn].key_code = key_table[btn];
+			si->btn[btn].enabled = true;
+		}
+		for (; btn < si->si_ofs.num_btns; btn++) {
+			si->btn[btn].key_code = KEY_RESERVED;
+			si->btn[btn].enabled = true;
+		}
+
 		return rc;
 	}
 
-	si->si_ofs.btn_keys_size = si->si_ofs.num_btns *
-		sizeof(struct cyttsp4_btn);
-
-	if (si->si_ofs.btn_keys_size <= 0)
-		return -EINVAL;
-
-	p = krealloc(si->btn, si->si_ofs.btn_keys_size, GFP_KERNEL|__GFP_ZERO);
-	if (p == NULL) {
-		dev_err(cd->dev, "%s: %s\n", __func__,
-			"fail alloc btn_keys memory");
-		return -ENOMEM;
-	}
-	si->btn = p;
-
-	if (cd->pdata->sett[CY_IC_GRPNUM_BTN_KEYS] == NULL)
-		num_defined_keys = 0;
-	else if (cd->pdata->sett[CY_IC_GRPNUM_BTN_KEYS]->data == NULL)
-		num_defined_keys = 0;
-	else
-		num_defined_keys = cd->pdata->sett[CY_IC_GRPNUM_BTN_KEYS]->size;
-
-	for (btn = 0; btn < si->si_ofs.num_btns
-			&& btn < num_defined_keys; btn++) {
-		key_table = (u16 *)cd->pdata->sett[CY_IC_GRPNUM_BTN_KEYS]->data;
-		si->btn[btn].key_code = key_table[btn];
-		si->btn[btn].state = CY_BTN_RELEASED;
-		si->btn[btn].enabled = true;
-	}
-	for (; btn < si->si_ofs.num_btns; btn++) {
-		si->btn[btn].key_code = KEY_RESERVED;
-		si->btn[btn].state = CY_BTN_RELEASED;
-		si->btn[btn].enabled = true;
-	}
-
+	si->si_ofs.btn_keys_size = 0;
+	kfree(si->btn);
+	si->btn = NULL;
 	return rc;
 }
 
 static int cyttsp4_si_get_op_data_ptrs(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	void *p;
-	int size;
+	if (si->xy_mode == NULL) {
+		si->xy_mode = kzalloc(si->si_ofs.mode_size, GFP_KERNEL);
+		if (si->xy_mode == NULL)
+			return -ENOMEM;
+	}
 
-	p = krealloc(si->xy_mode, si->si_ofs.mode_size +
-			si->si_ofs.data_size, GFP_KERNEL|__GFP_ZERO);
-	if (p == NULL)
-		return -ENOMEM;
-	si->xy_mode = p;
-	si->xy_data = &si->xy_mode[si->si_ofs.tt_stat_ofs + 1];
+	if (si->xy_data == NULL) {
+		si->xy_data = kzalloc(si->si_ofs.data_size, GFP_KERNEL);
+		if (si->xy_data == NULL)
+			return -ENOMEM;
+	}
 
-	size = si->si_ofs.btn_rec_size * si->si_ofs.num_btns;
-	if (!size)
-		return 0;
-
-	p = krealloc(si->btn_rec_data, size, GFP_KERNEL|__GFP_ZERO);
-	if (p == NULL)
-		return -ENOMEM;
-	si->btn_rec_data = p;
-
+	if (si->btn_rec_data == NULL) {
+		si->btn_rec_data = kzalloc(si->si_ofs.btn_rec_size *
+					   si->si_ofs.num_btns, GFP_KERNEL);
+		if (si->btn_rec_data == NULL)
+			return -ENOMEM;
+	}
+#ifdef SHOK_SENSOR_DATA_MODE
+	/* initialize */
+	si->monitor.mntr_status = CY_MNTR_DISABLED;
+	memset(si->monitor.sensor_data, 0, sizeof(si->monitor.sensor_data));
+#endif
 	return 0;
 }
 
 static void cyttsp4_si_put_log_data(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	dev_dbg(cd->dev, "%s: cydata_ofs =%4zu siz=%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: cydata_ofs =%4d siz=%4d\n", __func__,
 		si->si_ofs.cydata_ofs, si->si_ofs.cydata_size);
-	dev_dbg(cd->dev, "%s: test_ofs   =%4zu siz=%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: test_ofs   =%4d siz=%4d\n", __func__,
 		si->si_ofs.test_ofs, si->si_ofs.test_size);
-	dev_dbg(cd->dev, "%s: pcfg_ofs   =%4zu siz=%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: pcfg_ofs   =%4d siz=%4d\n", __func__,
 		si->si_ofs.pcfg_ofs, si->si_ofs.pcfg_size);
-	dev_dbg(cd->dev, "%s: opcfg_ofs  =%4zu siz=%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: opcfg_ofs  =%4d siz=%4d\n", __func__,
 		si->si_ofs.opcfg_ofs, si->si_ofs.opcfg_size);
-	dev_dbg(cd->dev, "%s: ddata_ofs  =%4zu siz=%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: ddata_ofs  =%4d siz=%4d\n", __func__,
 		si->si_ofs.ddata_ofs, si->si_ofs.ddata_size);
-	dev_dbg(cd->dev, "%s: mdata_ofs  =%4zu siz=%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: mdata_ofs  =%4d siz=%4d\n", __func__,
 		si->si_ofs.mdata_ofs, si->si_ofs.mdata_size);
 
-	dev_dbg(cd->dev, "%s: cmd_ofs       =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: cmd_ofs       =%4d\n", __func__,
 		si->si_ofs.cmd_ofs);
-	dev_dbg(cd->dev, "%s: rep_ofs       =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: rep_ofs       =%4d\n", __func__,
 		si->si_ofs.rep_ofs);
-	dev_dbg(cd->dev, "%s: rep_sz        =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: rep_sz        =%4d\n", __func__,
 		si->si_ofs.rep_sz);
-	dev_dbg(cd->dev, "%s: num_btns      =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: num_btns      =%4d\n", __func__,
 		si->si_ofs.num_btns);
-	dev_dbg(cd->dev, "%s: num_btn_regs  =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: num_btn_regs  =%4d\n", __func__,
 		si->si_ofs.num_btn_regs);
-	dev_dbg(cd->dev, "%s: tt_stat_ofs   =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: tt_stat_ofs   =%4d\n", __func__,
 		si->si_ofs.tt_stat_ofs);
-	dev_dbg(cd->dev, "%s: tch_rec_size   =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: tch_rec_size   =%4d\n", __func__,
 		si->si_ofs.tch_rec_size);
-	dev_dbg(cd->dev, "%s: max_tchs      =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: max_tchs      =%4d\n", __func__,
 		si->si_ofs.max_tchs);
-	dev_dbg(cd->dev, "%s: mode_size     =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: mode_size     =%4d\n", __func__,
 		si->si_ofs.mode_size);
-	dev_dbg(cd->dev, "%s: data_size     =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: data_size     =%4d\n", __func__,
 		si->si_ofs.data_size);
-	dev_dbg(cd->dev, "%s: rep_hdr_size  =%4zu\n", __func__,
-		si->si_ofs.rep_hdr_size);
-	dev_dbg(cd->dev, "%s: map_sz        =%4zu\n", __func__,
+	dev_dbg(cd->dev, "%s: map_sz        =%4d\n", __func__,
 		si->si_ofs.map_sz);
 
-	dev_dbg(cd->dev, "%s: btn_rec_size   =%2zu\n", __func__,
+	dev_dbg(cd->dev, "%s: btn_rec_size   =%2d\n", __func__,
 		si->si_ofs.btn_rec_size);
-	dev_dbg(cd->dev, "%s: btn_diff_ofs  =%2zu\n", __func__,
+	dev_dbg(cd->dev, "%s: btn_diff_ofs  =%2d\n", __func__,
 		si->si_ofs.btn_diff_ofs);
-	dev_dbg(cd->dev, "%s: btn_diff_size  =%2zu\n", __func__,
+	dev_dbg(cd->dev, "%s: btn_diff_size  =%2d\n", __func__,
 		si->si_ofs.btn_diff_size);
 
-	dev_dbg(cd->dev, "%s: max_x    = 0x%04X (%zu)\n", __func__,
-		(unsigned int)si->si_ofs.max_x, si->si_ofs.max_x);
-	dev_dbg(cd->dev, "%s: x_origin = %zu (%s)\n", __func__,
+	dev_dbg(cd->dev, "%s: max_x    = 0x%04X (%d)\n", __func__,
+		si->si_ofs.max_x, si->si_ofs.max_x);
+	dev_dbg(cd->dev, "%s: x_origin = %d (%s)\n", __func__,
 		si->si_ofs.x_origin,
 		si->si_ofs.x_origin == CY_NORMAL_ORIGIN ?
 		"left corner" : "right corner");
-	dev_dbg(cd->dev, "%s: max_y    = 0x%04X (%zu)\n", __func__,
-		(unsigned int)si->si_ofs.max_y, si->si_ofs.max_y);
-	dev_dbg(cd->dev, "%s: y_origin = %zu (%s)\n", __func__,
+	dev_dbg(cd->dev, "%s: max_y    = 0x%04X (%d)\n", __func__,
+		si->si_ofs.max_y, si->si_ofs.max_y);
+	dev_dbg(cd->dev, "%s: y_origin = %d (%s)\n", __func__,
 		si->si_ofs.y_origin,
 		si->si_ofs.y_origin == CY_NORMAL_ORIGIN ?
 		"upper corner" : "lower corner");
-	dev_dbg(cd->dev, "%s: max_p    = 0x%04X (%zu)\n", __func__,
-		(unsigned int)si->si_ofs.max_p, si->si_ofs.max_p);
+	dev_dbg(cd->dev, "%s: max_p    = 0x%04X (%d)\n", __func__,
+		si->si_ofs.max_p, si->si_ofs.max_p);
 
 	dev_dbg(cd->dev, "%s: xy_mode=%p xy_data=%p\n", __func__,
 		si->xy_mode, si->xy_data);
@@ -1101,7 +706,6 @@ static int cyttsp4_get_sysinfo_regs(struct cyttsp4_core_data *cd)
 			__func__);
 		return rc;
 	}
-
 	cyttsp4_si_put_log_data(cd);
 
 	/* provide flow control handshake */
@@ -1110,68 +714,48 @@ static int cyttsp4_get_sysinfo_regs(struct cyttsp4_core_data *cd)
 		dev_err(cd->dev, "%s: handshake fail on sysinfo reg\n",
 			__func__);
 
-	mutex_lock(&cd->system_lock);
 	si->ready = true;
-	mutex_unlock(&cd->system_lock);
 	return rc;
-}
-
-static void cyttsp4_queue_startup_(struct cyttsp4_core_data *cd)
-{
-	if (cd->startup_state == STARTUP_NONE) {
-		cd->startup_state = STARTUP_QUEUED;
-		schedule_work(&cd->startup_work);
-		dev_info(cd->dev, "%s: cyttsp4_startup queued\n", __func__);
-	} else {
-		dev_dbg(cd->dev, "%s: startup_state = %d\n", __func__,
-			cd->startup_state);
-	}
 }
 
 static void cyttsp4_queue_startup(struct cyttsp4_core_data *cd)
 {
-	dev_vdbg(cd->dev, "%s: enter\n", __func__);
-	mutex_lock(&cd->system_lock);
-	cyttsp4_queue_startup_(cd);
-	mutex_unlock(&cd->system_lock);
+	queue_work(cd->startup_work_q, &cd->startup_work);
+	dev_info(cd->dev, "%s: cyttsp4_startup queued\n", __func__);
 }
 
-static void call_atten_cb(struct cyttsp4_core_data *cd,
-		enum cyttsp4_atten_type type, int mode)
+void cyttsp4_queue_startup_and_wait(struct cyttsp4_core_data *cd)
+{
+	/* Check if there is a pending startup request */
+	if (flush_work_sync(&cd->startup_work)) {
+		dev_vdbg(cd->dev, "%s: Work pending 1\n", __func__);
+		return;
+	}
+
+	/* Queue one and wait until it finishes */
+	cyttsp4_queue_startup(cd);
+
+	flush_work_sync(&cd->startup_work);
+	dev_vdbg(cd->dev, "%s: Work pending 2\n", __func__);
+}
+
+static void call_atten_cb(struct cyttsp4_core_data *cd, int mode)
 {
 	struct atten_node *atten, *atten_n;
 
-	dev_vdbg(cd->dev, "%s: check list type=%d mode=%d\n",
-		__func__, type, mode);
+	dev_vdbg(cd->dev, "%s: check list mode=%d\n", __func__, mode);
 	spin_lock(&cd->spinlock);
 	list_for_each_entry_safe(atten, atten_n,
-			&cd->atten_list[type], node) {
-		if (!mode || atten->mode & mode) {
+			&cd->atten_list[CY_ATTEN_IRQ], node) {
+		if (atten->mode & mode) {
 			spin_unlock(&cd->spinlock);
-			dev_vdbg(cd->dev, "%s: attention for '%s'", __func__,
-				dev_name(&atten->ttsp->dev));
+			dev_vdbg(cd->dev, "%s: attention for mode=%d",
+					__func__, atten->mode);
 			atten->func(atten->ttsp);
 			spin_lock(&cd->spinlock);
 		}
 	}
 	spin_unlock(&cd->spinlock);
-}
-
-static irqreturn_t cyttsp4_hard_irq(int irq, void *handle)
-{
-	struct cyttsp4_core_data *cd = handle;
-
-	/*
-	 * Check whether this IRQ should be ignored (external)
-	 * This should be the very first thing to check since
-	 * ignore_irq may be set for a very short period of time
-	 */
-	if (atomic_read(&cd->ignore_irq)) {
-		dev_vdbg(cd->dev, "%s: Ignoring IRQ\n", __func__);
-		return IRQ_HANDLED;
-	}
-
-	return IRQ_WAKE_THREAD;
 }
 
 static irqreturn_t cyttsp4_irq(int irq, void *handle)
@@ -1180,16 +764,41 @@ static irqreturn_t cyttsp4_irq(int irq, void *handle)
 	struct device *dev = cd->dev;
 	enum cyttsp4_mode cur_mode;
 	u8 cmd_ofs = cd->sysinfo.si_ofs.cmd_ofs;
-	bool command_complete = false;
 	u8 mode[3];
 	int rc;
 	u8 cat_masked_cmd;
+	static int handshake_error_count;
 
-	// dev_dbg(dev, "%s int:0x%x\n", __func__, cd->int_status);
+	/* Check whether this IRQ should be ignored (internal) */
+	if (cd->int_status & CY_INT_IGNORE) {
+		dev_vdbg(dev, "%s: Ignoring IRQ\n", __func__);
+		return IRQ_HANDLED;
+	}
+
+	/*
+	 * Check whether this IRQ should be ignored (external)
+	 * This should be the very first thing to check since
+	 * ignore_irq may be set for a very short period of time
+	 */
+	if (atomic_read(&cd->ignore_irq)) {
+		dev_vdbg(dev, "%s: Ignoring IRQ\n", __func__);
+		return IRQ_HANDLED;
+	}
+
+	dev_dbg(dev, "%s int:0x%x\n", __func__, cd->int_status);
 
 	mutex_lock(&cd->system_lock);
 
-	rc = cyttsp4_adap_read(cd, CY_REG_BASE, mode, sizeof(mode));
+	/* Just to debug */
+	if (cd->sleep_state == SS_SLEEP_ON) {
+		dev_vdbg(dev, "%s: Received IRQ while in sleep\n",
+			__func__);
+	} else if (cd->sleep_state == SS_SLEEPING) {
+		dev_vdbg(dev, "%s: Received IRQ while sleeping\n",
+			__func__);
+	}
+
+	rc = cyttsp4_adap_read(cd->core->adap, CY_REG_BASE, mode, sizeof(mode));
 	if (rc) {
 		dev_err(cd->dev, "%s: Fail read adapter r=%d\n", __func__, rc);
 		goto cyttsp4_irq_exit;
@@ -1197,50 +806,37 @@ static irqreturn_t cyttsp4_irq(int irq, void *handle)
 	dev_vdbg(dev, "%s mode[0-2]:0x%X 0x%X 0x%X\n", __func__,
 			mode[0], mode[1], mode[2]);
 
-	if (unlikely(mode[0] == CY_CORE_BL_HOST_SYNC_BYTE)
-	        && unlikely(cd->mode == CY_MODE_BOOTLOADER)) {
-	    dev_err(dev, "%s: False interrupt in bootloader mode\n", __func__);
-	    goto cyttsp4_irq_exit;
-	}
-
-	if (IS_BOOTLOADER(mode[0], mode[1])) {
+	if (IS_BOOTLOADER(mode[0])) {
 		cur_mode = CY_MODE_BOOTLOADER;
 		dev_vdbg(dev, "%s: bl running\n", __func__);
-		call_atten_cb(cd, CY_ATTEN_IRQ, cur_mode);
-
-		/* switch to bootloader */
-		if (cd->mode != CY_MODE_BOOTLOADER)
-			dev_dbg(dev, "%s: restart switch to bl m=%d -> m=%d\n",
-			__func__, cd->mode, cur_mode);
-
-		/* catch operation->bl glitch */
-		if (cd->mode != CY_MODE_BOOTLOADER
-				&& cd->mode != CY_MODE_UNKNOWN) {
-			/* Incase startup_state do not let startup_() */
-			cd->mode = CY_MODE_UNKNOWN;
-			cyttsp4_queue_startup_(cd);
+		call_atten_cb(cd, cur_mode);
+		if (cd->mode == CY_MODE_BOOTLOADER) {
+			/* Signal bootloader heartbeat heard */
+			wake_up(&cd->wait_q);
 			goto cyttsp4_irq_exit;
 		}
 
-		/* Recover if stuck in bootloader idle mode */
-		if (cd->mode == CY_MODE_BOOTLOADER) {
-			if (IS_BOOTLOADER_IDLE(mode[0], mode[1])) {
-				if (cd->heartbeat_count > 3) {
-					cd->heartbeat_count = 0;
-					cyttsp4_queue_startup_(cd);
-					goto cyttsp4_irq_exit;
-				}
-				cd->heartbeat_count++;
-			}
+		/* switch to bootloader */
+		dev_dbg(dev, "%s: restart switch to bl m=%d -> m=%d\n",
+			__func__, cd->mode, cur_mode);
+
+		/* catch operation->bl glitch */
+		if (cd->mode != CY_MODE_UNKNOWN) {
+			cyttsp4_queue_startup(cd);
+			goto cyttsp4_irq_exit;
 		}
 
+		/*
+		 * do not wake thread on this switch since
+		 * it is possible to get an early heartbeat
+		 * prior to performing the reset
+		 */
 		cd->mode = cur_mode;
-		/* Signal bootloader heartbeat heard */
-		wake_up(&cd->wait_q);
+
 		goto cyttsp4_irq_exit;
 	}
 
-	switch (mode[0] & CY_HST_DEVICE_MODE) {
+	switch (mode[0] & CY_HST_MODE) {
 	case CY_HST_OPERATE:
 		cur_mode = CY_MODE_OPERATIONAL;
 		dev_vdbg(dev, "%s: operational\n", __func__);
@@ -1250,14 +846,18 @@ static irqreturn_t cyttsp4_irq(int irq, void *handle)
 		/* set the start sensor mode state. */
 		cat_masked_cmd = mode[2] & CY_CMD_MASK;
 
+#ifdef SHOK_SENSOR_DATA_MODE
+		if (cat_masked_cmd == CY_CMD_CAT_START_SENSOR_DATA_MODE)
+			cd->sysinfo.monitor.mntr_status = CY_MNTR_INITIATED;
+		else
+			cd->sysinfo.monitor.mntr_status = CY_MNTR_DISABLED;
+#endif
 		/* Get the Debug info for the interrupt. */
-		if (cat_masked_cmd != CY_CMD_CAT_NULL &&
-				cat_masked_cmd !=
-					CY_CMD_CAT_RETRIEVE_PANEL_SCAN &&
+		if (cat_masked_cmd != CY_CMD_CAT_RETRIEVE_PANEL_SCAN &&
 				cat_masked_cmd != CY_CMD_CAT_EXEC_PANEL_SCAN)
-			dev_info(cd->dev,
-				"%s: cyttsp4_CaT_IRQ=%02X %02X %02X\n",
-				__func__, mode[0], mode[1], mode[2]);
+			dev_info(cd->dev, "%s: cyttsp4_CaT_IRQ=" \
+					"%02X %02X %02X\n", __func__,
+					mode[0], mode[1], mode[2]);
 		dev_vdbg(dev, "%s: CaT\n", __func__);
 		break;
 	case CY_HST_SYSINFO:
@@ -1271,28 +871,10 @@ static irqreturn_t cyttsp4_irq(int irq, void *handle)
 		break;
 	}
 
-	/* Check whether this IRQ should be ignored (internal) */
-	if (cd->int_status & CY_INT_IGNORE) {
-		if (IS_DEEP_SLEEP_CONFIGURED(cd->easy_wakeup_gesture)) {
-			/* Put device back to sleep on premature wakeup */
-			dev_dbg(dev, "%s: Put device back to sleep\n",
-				__func__);
-			_cyttsp4_put_device_into_deep_sleep(cd, mode[0]);
-			goto cyttsp4_irq_exit;
-		}
-		/* Check for Wait for Event command */
-		if ((mode[cmd_ofs] & CY_CMD_MASK) == CY_CMD_OP_WAIT_FOR_EVENT
-				&& mode[cmd_ofs] & CY_CMD_COMPLETE) {
-			cd->wake_initiated_by_device = 1;
-			call_atten_cb(cd, CY_ATTEN_WAKE, 0);
-			goto cyttsp4_irq_handshake;
-		}
-	}
-
 	/* Check for wake up interrupt */
 	if (cd->int_status & CY_INT_AWAKE) {
 		cd->int_status &= ~CY_INT_AWAKE;
-		wake_up(&cd->wait_q);
+		wake_up(&cd->sleep_q);
 		dev_vdbg(dev, "%s: Received wake up interrupt\n", __func__);
 		goto cyttsp4_irq_handshake;
 	}
@@ -1317,7 +899,8 @@ static irqreturn_t cyttsp4_irq(int irq, void *handle)
 				cur_mode, cd->int_status);
 		dev_vdbg(dev, "%s: Unexpected mode change, startup\n",
 				__func__);
-		cyttsp4_queue_startup_(cd);
+		if (!cd->is_probe)
+			cyttsp4_queue_startup(cd);
 		goto cyttsp4_irq_exit;
 	}
 
@@ -1326,44 +909,40 @@ static irqreturn_t cyttsp4_irq(int irq, void *handle)
 			__func__, mode[cmd_ofs], cd->cmd_toggle);
 	if ((cd->int_status & CY_INT_EXEC_CMD)
 			&& mode[cmd_ofs] & CY_CMD_COMPLETE) {
-		command_complete = true;
 		cd->int_status &= ~CY_INT_EXEC_CMD;
 		dev_vdbg(dev, "%s: Received command complete interrupt\n",
 				__func__);
 		wake_up(&cd->wait_q);
-		/*
-		 * It is possible to receive a single interrupt for
-		 * command complete and touch/button status report.
-		 * Continue processing for a possible status report.
-		 */
+		goto cyttsp4_irq_handshake;
 	}
 
-	/* Copy the mode registers */
-	if (cd->sysinfo.xy_mode)
-		memcpy(cd->sysinfo.xy_mode, mode, sizeof(mode));
-
-	/* This should be status report, read status and touch regs */
+	/* This should be status report, read status regs */
 	if (cd->mode == CY_MODE_OPERATIONAL) {
-		dev_vdbg(dev, "%s: Read status and touch registers\n",
-			__func__);
-		cd->heartbeat_count = 0;
-		rc = cyttsp4_load_status_and_touch_regs(cd, !command_complete);
+		dev_vdbg(dev, "%s: Read status registers\n", __func__);
+		rc = cyttsp4_load_status_regs(cd);
 		if (rc < 0)
-			dev_err(dev, "%s: fail read mode/touch regs r=%d\n",
+			dev_err(dev, "%s: fail read mode regs r=%d\n",
 				__func__, rc);
 	}
 
 	/* attention IRQ */
-	call_atten_cb(cd, CY_ATTEN_IRQ, cd->mode);
+	call_atten_cb(cd, cd->mode);
 
 cyttsp4_irq_handshake:
 	/* handshake the event */
 	dev_vdbg(dev, "%s: Handshake mode=0x%02X r=%d\n",
 			__func__, mode[0], rc);
 	rc = cyttsp4_handshake(cd, mode[0]);
-	if (rc < 0)
+	if (rc < 0) {
 		dev_err(dev, "%s: Fail handshake mode=0x%02X r=%d\n",
 				__func__, mode[0], rc);
+		if (++handshake_error_count > CY_CORE_HANDSHAKE_ERROR_MAX) {
+			cyttsp4_queue_startup(cd);
+			handshake_error_count = 0;
+		}
+	} else {
+		handshake_error_count = 0;
+	}
 
 	/*
 	 * a non-zero udelay period is required for using
@@ -1383,8 +962,8 @@ static void cyttsp4_start_wd_timer(struct cyttsp4_core_data *cd)
 	if (!CY_WATCHDOG_TIMEOUT)
 		return;
 
-	mod_timer(&cd->watchdog_timer, jiffies +
-			msecs_to_jiffies(CY_WATCHDOG_TIMEOUT));
+	mod_timer(&cd->timer, jiffies + CY_WATCHDOG_TIMEOUT);
+	return;
 }
 
 static void cyttsp4_stop_wd_timer(struct cyttsp4_core_data *cd)
@@ -1392,16 +971,49 @@ static void cyttsp4_stop_wd_timer(struct cyttsp4_core_data *cd)
 	if (!CY_WATCHDOG_TIMEOUT)
 		return;
 
-	/*
-	 * Ensure we wait until the watchdog timer
-	 * running on a different CPU finishes
-	 */
-	del_timer_sync(&cd->watchdog_timer);
-	cancel_work_sync(&cd->watchdog_work);
-	del_timer_sync(&cd->watchdog_timer);
+	del_timer(&cd->timer);
+	cancel_work_sync(&cd->work);
+	return;
 }
 
-static void cyttsp4_watchdog_timer(unsigned long handle)
+static void cyttsp4_timer_watchdog(struct work_struct *work)
+{
+	struct cyttsp4_core_data *cd =
+			container_of(work, struct cyttsp4_core_data, work);
+	int rep_stat;
+	int mode;
+	int retval;
+
+	if (cd == NULL) {
+		dev_err(cd->dev, "%s: NULL context pointer\n", __func__);
+		return;
+	}
+
+	mutex_lock(&cd->system_lock);
+	retval = cyttsp4_load_status_regs(cd);
+	if (retval < 0) {
+		dev_err(cd->dev, "%s: failed to access device" \
+				" in watchdog timer r=%d\n", __func__, retval);
+		cyttsp4_queue_startup(cd);
+		goto cyttsp4_timer_watchdog_exit_error;
+	}
+	mode = cd->sysinfo.xy_mode[CY_REG_BASE];
+	rep_stat = cd->sysinfo.xy_mode[cd->sysinfo.si_ofs.rep_ofs];
+	if (IS_BOOTLOADER(mode) && IS_BOOTLOADER(rep_stat)) {
+		dev_err(cd->dev, "%s: device found in bootloader mode" \
+				" when operational mode rep_stat=0x%02X\n",
+				__func__, rep_stat);
+		cyttsp4_queue_startup(cd);
+		goto cyttsp4_timer_watchdog_exit_error;
+	}
+
+	cyttsp4_start_wd_timer(cd);
+ cyttsp4_timer_watchdog_exit_error:
+	mutex_unlock(&cd->system_lock);
+	return;
+}
+
+static void cyttsp4_timer(unsigned long handle)
 {
 	struct cyttsp4_core_data *cd = (struct cyttsp4_core_data *)handle;
 
@@ -1410,13 +1022,13 @@ static void cyttsp4_watchdog_timer(unsigned long handle)
 	if (!cd)
 		return;
 
-	if (!work_pending(&cd->watchdog_work))
-		schedule_work(&cd->watchdog_work);
+	if (!work_pending(&cd->work))
+		schedule_work(&cd->work);
 
 	return;
 }
 
-static int cyttsp4_write_(struct cyttsp4_device *ttsp, int mode, u16 addr,
+static int cyttsp4_write_(struct cyttsp4_device *ttsp, int mode, u8 addr,
 	const void *buf, int size)
 {
 	struct device *dev = &ttsp->dev;
@@ -1432,18 +1044,17 @@ static int cyttsp4_write_(struct cyttsp4_device *ttsp, int mode, u16 addr,
 		rc = -EACCES;
 		goto exit;
 	}
-	rc = cyttsp4_adap_write(cd, addr, buf, size);
+	rc = cyttsp4_adap_write(core->adap, addr, buf, size);
 exit:
 	mutex_unlock(&cd->adap_lock);
 	return rc;
 }
 
-static int cyttsp4_read_(struct cyttsp4_device *ttsp, int mode, u16 addr,
+static int cyttsp4_core_read(struct cyttsp4_core_data *cd, int mode, u8 addr,
 	void *buf, int size)
 {
-	struct device *dev = &ttsp->dev;
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
+	struct device *dev = cd->dev;
+	struct cyttsp4_core *core = cd->core;
 	int rc = 0;
 
 	mutex_lock(&cd->adap_lock);
@@ -1454,10 +1065,19 @@ static int cyttsp4_read_(struct cyttsp4_device *ttsp, int mode, u16 addr,
 		rc = -EACCES;
 		goto exit;
 	}
-	rc = cyttsp4_adap_read(cd, addr, buf, size);
+	rc = cyttsp4_adap_read(core->adap, addr, buf, size);
 exit:
 	mutex_unlock(&cd->adap_lock);
 	return rc;
+}
+
+static int cyttsp4_read_(struct cyttsp4_device *ttsp, int mode, u8 addr,
+	void *buf, int size)
+{
+	struct cyttsp4_core *core = ttsp->core;
+	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
+
+	return cyttsp4_core_read(cd, mode, addr, buf, size);
 }
 
 static int cyttsp4_subscribe_attention_(struct cyttsp4_device *ttsp,
@@ -1466,6 +1086,7 @@ static int cyttsp4_subscribe_attention_(struct cyttsp4_device *ttsp,
 {
 	struct cyttsp4_core *core = ttsp->core;
 	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
+	unsigned long flags;
 	struct atten_node *atten, *atten_new;
 
 	atten_new = kzalloc(sizeof(*atten_new), GFP_KERNEL);
@@ -1476,10 +1097,10 @@ static int cyttsp4_subscribe_attention_(struct cyttsp4_device *ttsp,
 
 	dev_dbg(cd->dev, "%s from '%s'\n", __func__, dev_name(cd->dev));
 
-	spin_lock(&cd->spinlock);
+	spin_lock_irqsave(&cd->spinlock, flags);
 	list_for_each_entry(atten, &cd->atten_list[type], node) {
 		if (atten->ttsp == ttsp && atten->mode == mode) {
-			spin_unlock(&cd->spinlock);
+			spin_unlock_irqrestore(&cd->spinlock, flags);
 			kfree(atten_new);
 			dev_vdbg(cd->dev, "%s: %s=%p %s=%d\n",
 				 __func__,
@@ -1495,7 +1116,7 @@ static int cyttsp4_subscribe_attention_(struct cyttsp4_device *ttsp,
 	atten_new->func = func;
 
 	list_add(&atten_new->node, &cd->atten_list[type]);
-	spin_unlock(&cd->spinlock);
+	spin_unlock_irqrestore(&cd->spinlock, flags);
 
 	return 0;
 }
@@ -1507,12 +1128,13 @@ static int cyttsp4_unsubscribe_attention_(struct cyttsp4_device *ttsp,
 	struct cyttsp4_core *core = ttsp->core;
 	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
 	struct atten_node *atten, *atten_n;
+	unsigned long flags;
 
-	spin_lock(&cd->spinlock);
+	spin_lock_irqsave(&cd->spinlock, flags);
 	list_for_each_entry_safe(atten, atten_n, &cd->atten_list[type], node) {
 		if (atten->ttsp == ttsp && atten->mode == mode) {
 			list_del(&atten->node);
-			spin_unlock(&cd->spinlock);
+			spin_unlock_irqrestore(&cd->spinlock, flags);
 			kfree(atten);
 			dev_vdbg(cd->dev, "%s: %s=%p %s=%d\n",
 				__func__,
@@ -1521,58 +1143,51 @@ static int cyttsp4_unsubscribe_attention_(struct cyttsp4_device *ttsp,
 			return 0;
 		}
 	}
-	spin_unlock(&cd->spinlock);
+	spin_unlock_irqrestore(&cd->spinlock, flags);
 
 	return -ENODEV;
 }
 
-static int request_exclusive(struct cyttsp4_core_data *cd, void *ownptr,
-		int timeout_ms)
+static int request_exclusive(struct cyttsp4_core_data *cd, void *ownptr, int t)
 {
-	int t = msecs_to_jiffies(timeout_ms);
-	bool with_timeout = (timeout_ms != 0);
+	int rc = 0;
 
 	mutex_lock(&cd->system_lock);
-	if (!cd->exclusive_dev && cd->exclusive_waits == 0) {
-		cd->exclusive_dev = ownptr;
-		goto exit;
-	}
-
-	cd->exclusive_waits++;
-wait:
-	mutex_unlock(&cd->system_lock);
-	if (with_timeout) {
-		t = wait_event_timeout(cd->wait_q, !cd->exclusive_dev, t);
+	if (cd->exclusive_dev != NULL) {
+		mutex_unlock(&cd->system_lock);
+		if (t)
+			t = wait_event_timeout(cd->wait_q,
+				cd->exclusive_dev == NULL, t);
+		else {
+			wait_event(cd->wait_q,
+				cd->exclusive_dev == NULL);
+			t = 1;
+		}
+		mutex_lock(&cd->system_lock);
 		if (IS_TMO(t)) {
-			dev_err(cd->dev, "%s: tmo waiting exclusive access\n",
-				__func__);
-			mutex_lock(&cd->system_lock);
-			cd->exclusive_waits--;
-			mutex_unlock(&cd->system_lock);
-			return -ETIME;
+			dev_err(cd->dev, "%s: %s\n", __func__,
+				"tmo waiting exclusive access");
+			rc = -ETIME;
+		} else {
+			cd->exclusive_dev = ownptr;
+			dev_vdbg(cd->dev, "%s: 1 %s ok =%p\n", __func__,
+				"request_exclusive", cd->exclusive_dev);
 		}
 	} else {
-		wait_event(cd->wait_q, !cd->exclusive_dev);
+		cd->exclusive_dev = ownptr;
+		dev_vdbg(cd->dev, "%s: 2 %s ok =%p\n", __func__,
+			"request_exclusive", cd->exclusive_dev);
 	}
-	mutex_lock(&cd->system_lock);
-	if (cd->exclusive_dev)
-		goto wait;
-	cd->exclusive_dev = ownptr;
-	cd->exclusive_waits--;
-exit:
 	mutex_unlock(&cd->system_lock);
-	dev_vdbg(cd->dev, "%s: request_exclusive ok=%p\n",
-		__func__, ownptr);
 
-	return 0;
+	return rc;
 }
 
-static int cyttsp4_request_exclusive_(struct cyttsp4_device *ttsp,
-		int timeout_ms)
+static int cyttsp4_request_exclusive_(struct cyttsp4_device *ttsp, int t)
 {
 	struct cyttsp4_core *core = ttsp->core;
 	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-	return request_exclusive(cd, (void *)ttsp, timeout_ms);
+	return request_exclusive(cd, (void *)ttsp, t);
 }
 
 /*
@@ -1601,116 +1216,91 @@ static int cyttsp4_release_exclusive_(struct cyttsp4_device *ttsp)
 	return release_exclusive(cd, (void *)ttsp);
 }
 
-static int cyttsp4_wait_bl_heartbeat(struct cyttsp4_core_data *cd)
-{
-	long t;
-	int rc = 0;
-
-	/* wait heartbeat */
-	dev_vdbg(cd->dev, "%s: wait heartbeat...\n", __func__);
-	t = wait_event_timeout(cd->wait_q, cd->mode == CY_MODE_BOOTLOADER,
-			msecs_to_jiffies(CY_CORE_RESET_AND_WAIT_TIMEOUT));
-	if (IS_TMO(t)) {
-		dev_err(cd->dev, "%s: tmo waiting bl heartbeat cd->mode=%d\n",
-			__func__, cd->mode);
-		rc = -ETIME;
-	}
-
-	return rc;
-}
-
-static int cyttsp4_wait_sysinfo_mode(struct cyttsp4_core_data *cd)
-{
-	long t;
-
-	dev_vdbg(cd->dev, "%s: wait sysinfo...\n", __func__);
-
-	t = wait_event_timeout(cd->wait_q, cd->mode == CY_MODE_SYSINFO,
-			msecs_to_jiffies(CY_CORE_WAIT_SYSINFO_MODE_TIMEOUT));
-	if (IS_TMO(t)) {
-		dev_err(cd->dev, "%s: tmo waiting exit bl cd->mode=%d\n",
-			__func__, cd->mode);
-		mutex_lock(&cd->system_lock);
-		cd->int_status &= ~CY_INT_MODE_CHANGE;
-		mutex_unlock(&cd->system_lock);
-		return -ETIME;
-	}
-
-	return 0;
-}
-
 static int cyttsp4_reset_and_wait(struct cyttsp4_core_data *cd)
 {
+	long t;
 	int rc;
 
 	/* reset hardware */
 	mutex_lock(&cd->system_lock);
 	dev_dbg(cd->dev, "%s: reset hw...\n", __func__);
-	rc = cyttsp4_hw_reset_(cd);
+	rc = cyttsp4_hw_reset(cd);
 	cd->mode = CY_MODE_UNKNOWN;
 	mutex_unlock(&cd->system_lock);
-	if (rc < 0) {
+	if (rc < 0)
 		dev_err(cd->dev, "%s: %s adap='%s' r=%d\n", __func__,
 			"Fail hw reset", cd->core->adap->id, rc);
-		return rc;
-	}
 
-	return cyttsp4_wait_bl_heartbeat(cd);
+	/* wait heartbeat */
+	dev_vdbg(cd->dev, "%s: wait heartbeat...\n", __func__);
+	t = wait_event_timeout(cd->wait_q, cd->mode == CY_MODE_BOOTLOADER,
+		msecs_to_jiffies(CY_CORE_RESET_AND_WAIT_TIMEOUT));
+	if  (IS_TMO(t)) {
+		dev_err(cd->dev, "%s: tmo waiting bl heartbeat cd->mode=%d\n",
+				__func__, cd->mode);
+		rc = -ETIME;
+	} else
+		rc = 0;
+
+	return rc;
+}
+
+/*
+ * returns err if refused or timeout(core uses fixed timeout period) occurs;
+ * blocks until ISR occurs
+ */
+static int cyttsp4_request_reset_(struct cyttsp4_device *ttsp)
+{
+	struct cyttsp4_core *core = ttsp->core;
+	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
+	int rc;
+
+	rc = cyttsp4_reset_and_wait(cd);
+	if (rc < 0)
+		dev_err(cd->dev, "%s: Error on h/w reset r=%d\n",
+			__func__, rc);
+
+	return rc;
+}
+
+/*
+ * returns err if refused ; if no error then restart has completed
+ * and system is in normal operating mode
+ */
+static int cyttsp4_request_restart_(struct cyttsp4_device *ttsp)
+{
+	struct cyttsp4_core *core = ttsp->core;
+	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
+
+	cyttsp4_queue_startup(cd);
+
+	return 0;
 }
 
 /*
  * returns err if refused or timeout; block until mode change complete
  * bit is set (mode change interrupt)
  */
-static int set_mode(struct cyttsp4_core_data *cd, int new_mode)
+static int set_mode(struct cyttsp4_core_data *cd, void *ownptr,
+		u8 new_dev_mode, int new_op_mode)
 {
-	u8 new_dev_mode;
-	u8 mode;
 	long t;
 	int rc;
-
-	switch (new_mode) {
-	case CY_MODE_OPERATIONAL:
-		new_dev_mode = CY_HST_OPERATE;
-		break;
-	case CY_MODE_SYSINFO:
-		new_dev_mode = CY_HST_SYSINFO;
-		break;
-	case CY_MODE_CAT:
-		new_dev_mode = CY_HST_CAT;
-		break;
-	default:
-		dev_err(cd->dev, "%s: invalid mode: %02X(%d)\n",
-			__func__, new_mode, new_mode);
-		return -EINVAL;
-	}
 
 	/* change mode */
 	dev_dbg(cd->dev, "%s: %s=%p new_dev_mode=%02X new_mode=%d\n",
 			__func__, "have exclusive", cd->exclusive_dev,
-			new_dev_mode, new_mode);
+			new_dev_mode, new_op_mode);
+	new_dev_mode |= CY_HST_MODE_CHANGE;
 
 	mutex_lock(&cd->system_lock);
-	rc = cyttsp4_adap_read(cd, CY_REG_BASE, &mode, sizeof(mode));
-	if (rc < 0) {
-		mutex_unlock(&cd->system_lock);
-		dev_err(cd->dev, "%s: Fail read mode r=%d\n",
-			__func__, rc);
-		goto exit;
-	}
-
-	/* Clear device mode bits and set to new mode */
-	mode &= ~CY_HST_DEVICE_MODE;
-	mode |= new_dev_mode | CY_HST_MODE_CHANGE;
-
 	cd->int_status |= CY_INT_MODE_CHANGE;
-	rc = cyttsp4_adap_write(cd, CY_REG_BASE, &mode, sizeof(mode));
-	mutex_unlock(&cd->system_lock);
-	if (rc < 0) {
+	rc = cyttsp4_adap_write(cd->core->adap, CY_REG_BASE,
+			&new_dev_mode, sizeof(new_dev_mode));
+	if (rc < 0)
 		dev_err(cd->dev, "%s: Fail write mode change r=%d\n",
 				__func__, rc);
-		goto exit;
-	}
+	mutex_unlock(&cd->system_lock);
 
 	/* wait for mode change done interrupt */
 	t = wait_event_timeout(cd->wait_q,
@@ -1728,51 +1318,7 @@ static int set_mode(struct cyttsp4_core_data *cd, int new_mode)
 		rc = -EINVAL;
 	}
 
-exit:
 	return rc;
-}
-
-/*
- * returns err if refused or timeout(core uses fixed timeout period) occurs;
- * blocks until ISR occurs
- */
-static int cyttsp4_request_reset_(struct cyttsp4_device *ttsp)
-{
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-	int rc;
-
-	mutex_lock(&cd->system_lock);
-	cd->sysinfo.ready = false;
-	mutex_unlock(&cd->system_lock);
-
-	rc = cyttsp4_reset_and_wait(cd);
-	if (rc < 0)
-		dev_err(cd->dev, "%s: Error on h/w reset r=%d\n",
-			__func__, rc);
-
-	return rc;
-}
-
-/*
- * returns err if refused ; if no error then restart has completed
- * and system is in normal operating mode
- */
-static int cyttsp4_request_restart_(struct cyttsp4_device *ttsp, bool wait)
-{
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-
-	mutex_lock(&cd->system_lock);
-	cd->sysinfo.ready = false;
-	mutex_unlock(&cd->system_lock);
-
-	cyttsp4_queue_startup(cd);
-
-	if (wait)
-		wait_event(cd->wait_q, cd->startup_state == STARTUP_NONE);
-
-	return 0;
 }
 
 static int cyttsp4_request_set_mode_(struct cyttsp4_device *ttsp, int mode)
@@ -1780,11 +1326,34 @@ static int cyttsp4_request_set_mode_(struct cyttsp4_device *ttsp, int mode)
 	struct cyttsp4_core *core = ttsp->core;
 	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
 	int rc;
+	enum cyttsp4_hst_mode_bits mode_bits;
+	switch (mode) {
+	case CY_MODE_OPERATIONAL:
+		mode_bits = CY_HST_OPERATE;
+		break;
+	case CY_MODE_SYSINFO:
+		mode_bits = CY_HST_SYSINFO;
+		break;
+	case CY_MODE_CAT:
+		mode_bits = CY_HST_CAT;
+		break;
+	default:
+		dev_err(cd->dev, "%s: invalid mode: %02X(%d)\n",
+			__func__, mode, mode);
+		return -EINVAL;
+	}
 
-	rc = set_mode(cd, mode);
+	rc = set_mode(cd, (void *)ttsp, mode_bits, mode);
 	if (rc < 0)
 		dev_err(cd->dev, "%s: fail set_mode=%02X(%d)\n",
 			__func__, cd->mode, cd->mode);
+#ifdef SHOK_SENSOR_DATA_MODE
+	if (cd->sysinfo.monitor.mntr_status == CY_MNTR_INITIATED &&
+			mode == CY_MODE_OPERATIONAL)
+		cd->sysinfo.monitor.mntr_status = CY_MNTR_STARTED;
+	else
+		cd->sysinfo.monitor.mntr_status = CY_MNTR_DISABLED;
+#endif
 
 	return rc;
 }
@@ -1797,23 +1366,11 @@ static struct cyttsp4_sysinfo *cyttsp4_request_sysinfo_(
 {
 	struct cyttsp4_core *core = ttsp->core;
 	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-	bool ready;
 
-	mutex_lock(&cd->system_lock);
-	ready = cd->sysinfo.ready;
-	mutex_unlock(&cd->system_lock);
-	if (ready)
+	if (cd->sysinfo.ready)
 		return &cd->sysinfo;
 
 	return NULL;
-}
-
-static struct cyttsp4_loader_platform_data *cyttsp4_request_loader_pdata_(
-		struct cyttsp4_device *ttsp)
-{
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-	return cd->pdata->loader_pdata;
 }
 
 static int cyttsp4_request_handshake_(struct cyttsp4_device *ttsp, u8 mode)
@@ -1841,28 +1398,32 @@ static int cyttsp4_request_toggle_lowpower_(struct cyttsp4_device *ttsp,
 	return rc;
 }
 
-static int _cyttsp4_wait_cmd_exec(struct cyttsp4_core_data *cd, int timeout_ms)
-{
-	struct device *dev = cd->dev;
-	int rc;
+static const u8 ldr_exit[] = {
+	0xFF, 0x01, 0x3B, 0x00, 0x00, 0x4F, 0x6D, 0x17
+};
 
-	rc = wait_event_timeout(cd->wait_q,
-			(cd->int_status & CY_INT_EXEC_CMD) == 0,
-			msecs_to_jiffies(timeout_ms));
-	if (IS_TMO(rc)) {
-		dev_err(dev, "%s: Command execution timed out\n",
-				__func__);
-		cd->int_status &= ~CY_INT_EXEC_CMD;
-		return -ETIME;
-	}
-	return 0;
-}
-
-static int _get_cmd_offs(struct cyttsp4_core_data *cd, u8 mode)
+/*
+ * Send command to device for CAT and OP modes
+ * return negative value on error, 0 on success
+ */
+static int request_exec_cmd(struct cyttsp4_core_data *cd, u8 mode,
+		u8 *cmd_buf, size_t cmd_size, u8 *return_buf,
+		size_t return_buf_size, int timeout)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
 	struct device *dev = cd->dev;
 	int cmd_ofs;
+	u8 command;
+	int rc;
+
+	mutex_lock(&cd->system_lock);
+	if (mode != cd->mode) {
+		dev_err(dev, "%s: %s (having %x while %x requested)\n",
+				__func__, "attempt to exec cmd in missing mode",
+				cd->mode, mode);
+		mutex_unlock(&cd->system_lock);
+		return -EACCES;
+	}
 
 	switch (mode) {
 	case CY_MODE_CAT:
@@ -1874,129 +1435,77 @@ static int _get_cmd_offs(struct cyttsp4_core_data *cd, u8 mode)
 	default:
 		dev_err(dev, "%s: Unsupported mode %x for exec cmd\n",
 				__func__, mode);
+		mutex_unlock(&cd->system_lock);
 		return -EACCES;
 	}
-
-	return cmd_ofs;
-}
-
-/*
- * Send command to device for CAT and OP modes
- * return negative value on error, 0 on success
- */
-static int _cyttsp4_exec_cmd(struct cyttsp4_core_data *cd, u8 mode,
-		u8 *cmd_buf, size_t cmd_size)
-{
-	struct device *dev = cd->dev;
-	int cmd_ofs;
-	int cmd_param_ofs;
-	u8 command;
-	u8 *cmd_param_buf;
-	size_t cmd_param_size;
-	int rc;
-
-	if (mode != cd->mode) {
-		dev_err(dev, "%s: %s (having %x while %x requested)\n",
-				__func__, "attempt to exec cmd in missing mode",
-				cd->mode, mode);
-		return -EACCES;
-	}
-
-	cmd_ofs = _get_cmd_offs(cd, mode);
-	if (cmd_ofs < 0)
-		return -EACCES;
-
-	cmd_param_ofs = cmd_ofs + 1;
-	cmd_param_buf = cmd_buf + 1;
-	cmd_param_size = cmd_size - 1;
 
 	/* Check if complete is set, so write new command */
-	rc = cyttsp4_adap_read(cd, cmd_ofs, &command, 1);
+	rc = cyttsp4_adap_read(cd->core->adap, cmd_ofs, &command, 1);
 	if (rc < 0) {
 		dev_err(dev, "%s: Error on read r=%d\n", __func__, rc);
+		mutex_unlock(&cd->system_lock);
 		return rc;
 	}
 
 	cd->cmd_toggle = GET_TOGGLE(command);
 	cd->int_status |= CY_INT_EXEC_CMD;
 
-	if ((command & CY_CMD_COMPLETE_MASK) == 0)
-		return -EBUSY;
+	if ((command & CY_CMD_COMPLETE_MASK) == 0) {
+		/* Let irq handler run */
+		mutex_unlock(&cd->system_lock);
+		rc = wait_event_timeout(cd->wait_q,
+				(cd->int_status & CY_INT_EXEC_CMD) == 0,
+				msecs_to_jiffies(timeout));
+		if (IS_TMO(rc)) {
+			dev_err(dev, "%s: Command execution timed out\n",
+					__func__);
+			cd->int_status &= ~CY_INT_EXEC_CMD;
+			return -EINVAL;
+		}
+
+		/* For next command */
+		mutex_lock(&cd->system_lock);
+		rc = cyttsp4_adap_read(cd->core->adap, cmd_ofs, &command, 1);
+		if (rc < 0) {
+			dev_err(dev, "%s: Error on read r=%d\n", __func__, rc);
+			mutex_unlock(&cd->system_lock);
+			return rc;
+		}
+		cd->cmd_toggle = GET_TOGGLE(command);
+		cd->int_status |= CY_INT_EXEC_CMD;
+	}
 
 	/*
 	 * Write new command
 	 * Only update command bits 0:5
-	 * Clear command complete bit & toggle bit
 	 */
-	cmd_buf[0] = cmd_buf[0] & CY_CMD_MASK;
-	/* Write command parameters first */
-	if (cmd_size > 1) {
-		rc = cyttsp4_adap_write(cd, cmd_param_ofs, cmd_param_buf,
-				cmd_param_size);
-		if (rc < 0) {
-			dev_err(dev, "%s: Error on write command parameters r=%d\n",
-				__func__, rc);
-			return rc;
-		}
-	}
-	/* Write the command */
-	rc = cyttsp4_adap_write(cd, cmd_ofs, cmd_buf, 1);
+	cmd_buf[0] = (command & ~CY_CMD_MASK)
+			| (cmd_buf[0] & CY_CMD_MASK);
+	/* Clear command complete bit */
+	cmd_buf[0] &= ~CY_CMD_COMPLETE_MASK;
+	rc = cyttsp4_adap_write(cd->core->adap, cmd_ofs, cmd_buf, cmd_size);
 	if (rc < 0) {
 		dev_err(dev, "%s: Error on write command r=%d\n",
 				__func__, rc);
-		return rc;
-	}
-
-	return 0;
-}
-
-static int cyttsp4_exec_cmd(struct cyttsp4_core_data *cd, u8 mode,
-		u8 *cmd_buf, size_t cmd_size, u8 *return_buf,
-		size_t return_buf_size, int timeout_ms)
-{
-	struct device *dev = cd->dev;
-	int cmd_ofs;
-	int cmd_return_ofs;
-	int rc;
-
-	mutex_lock(&cd->system_lock);
-	rc = _cyttsp4_exec_cmd(cd, mode, cmd_buf, cmd_size);
-	mutex_unlock(&cd->system_lock);
-
-	if (rc == -EBUSY) {
-		rc = _cyttsp4_wait_cmd_exec(cd, CY_COMMAND_COMPLETE_TIMEOUT);
-		if (rc)
-			return rc;
-		mutex_lock(&cd->system_lock);
-		rc = _cyttsp4_exec_cmd(cd, mode, cmd_buf, cmd_size);
 		mutex_unlock(&cd->system_lock);
-	}
-
-	if (rc < 0)
 		return rc;
-
-	if (timeout_ms == 0)
-		return 0;
+	}
 
 	/*
 	 * Wait command to be completed
 	 */
-	rc = _cyttsp4_wait_cmd_exec(cd, timeout_ms);
-	if (rc < 0)
-		return rc;
-
-	if (return_buf_size == 0 || return_buf == NULL)
-		return 0;
-
-	mutex_lock(&cd->system_lock);
-	cmd_ofs = _get_cmd_offs(cd, mode);
 	mutex_unlock(&cd->system_lock);
-	if (cmd_ofs < 0)
-		return -EACCES;
+	rc = wait_event_timeout(cd->wait_q,
+			(cd->int_status & CY_INT_EXEC_CMD) == 0,
+			msecs_to_jiffies(timeout));
+	if (IS_TMO(rc)) {
+		dev_err(dev, "%s: Command execution timed out\n", __func__);
+		cd->int_status &= ~CY_INT_EXEC_CMD;
+		return -EINVAL;
+	}
 
-	cmd_return_ofs = cmd_ofs + 1;
-
-	rc = cyttsp4_adap_read(cd, cmd_return_ofs, return_buf, return_buf_size);
+	rc = cyttsp4_adap_read(cd->core->adap, cmd_ofs + 1, return_buf,
+			return_buf_size);
 	if (rc < 0) {
 		dev_err(dev, "%s: Error on read 3 r=%d\n", __func__, rc);
 		return rc;
@@ -2007,726 +1516,14 @@ static int cyttsp4_exec_cmd(struct cyttsp4_core_data *cd, u8 mode,
 
 static int cyttsp4_request_exec_cmd_(struct cyttsp4_device *ttsp, u8 mode,
 		u8 *cmd_buf, size_t cmd_size, u8 *return_buf,
-		size_t return_buf_size, int timeout_ms)
-{
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-	return cyttsp4_exec_cmd(cd, mode, cmd_buf, cmd_size,
-			return_buf, return_buf_size, timeout_ms);
-}
-
-static int cyttsp4_get_parameter(struct cyttsp4_core_data *cd, u8 param_id,
-		u32 *param_value)
-{
-	u8 command_buf[CY_CMD_OP_GET_PARAM_CMD_SZ];
-	u8 return_buf[CY_CMD_OP_GET_PARAM_RET_SZ];
-	u8 param_size;
-	u8 *value_buf;
-	int rc;
-
-	command_buf[0] = CY_CMD_OP_GET_PARAM;
-	command_buf[1] = param_id;
-	rc = cyttsp4_exec_cmd(cd, CY_MODE_OPERATIONAL,
-			command_buf, CY_CMD_OP_GET_PARAM_CMD_SZ,
-			return_buf, CY_CMD_OP_GET_PARAM_RET_SZ,
-			CY_COMMAND_COMPLETE_TIMEOUT);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: Unable to execute get parameter command.\n",
-			__func__);
-		return rc;
-	}
-
-	if (return_buf[0] != param_id) {
-		dev_err(cd->dev, "%s: Fail to execute get parameter command.\n",
-			__func__);
-		return -EIO;
-	}
-
-	param_size = return_buf[1];
-	value_buf = &return_buf[2];
-
-	*param_value = 0;
-	while (param_size--)
-		*param_value += *(value_buf++) << (8 * param_size);
-
-	return 0;
-}
-
-static int cyttsp4_set_parameter(struct cyttsp4_core_data *cd, u8 param_id,
-		u8 param_size, u32 param_value)
-{
-	u8 command_buf[CY_CMD_OP_SET_PARAM_CMD_SZ];
-	u8 return_buf[CY_CMD_OP_SET_PARAM_RET_SZ];
-	int rc;
-
-	command_buf[0] = CY_CMD_OP_SET_PARAM;
-	command_buf[1] = param_id;
-	command_buf[2] = param_size;
-
-	if (param_size == 1) {
-		command_buf[3] = (u8)param_value;
-	} else if (param_size == 2) {
-		command_buf[3] = (u8)(param_value >> 8);
-		command_buf[4] = (u8)param_value;
-	} else if (param_size == 4) {
-		command_buf[3] = (u8)(param_value >> 24);
-		command_buf[4] = (u8)(param_value >> 16);
-		command_buf[5] = (u8)(param_value >> 8);
-		command_buf[6] = (u8)param_value;
-	} else {
-		dev_err(cd->dev, "%s: Invalid parameter size %d\n",
-			__func__, param_size);
-		return -EINVAL;
-	}
-
-	rc = cyttsp4_exec_cmd(cd, CY_MODE_OPERATIONAL,
-			command_buf, 3 + param_size,
-			return_buf, CY_CMD_OP_SET_PARAM_RET_SZ,
-			CY_COMMAND_COMPLETE_TIMEOUT);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: Unable to execute set parameter command.\n",
-			__func__);
-		return rc;
-	}
-
-	if (return_buf[0] != param_id || return_buf[1] != param_size) {
-		dev_err(cd->dev, "%s: Fail to execute set parameter command.\n",
-			__func__);
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static int cyttsp4_get_scantype(struct cyttsp4_core_data *cd, u8 *scantype)
-{
-	int rc;
-	u32 value;
-
-	rc = cyttsp4_get_parameter(cd, CY_RAM_ID_SCAN_TYPE, &value);
-	if (!rc)
-		*scantype = (u8)value;
-
-	return rc;
-}
-
-static int cyttsp4_set_scantype(struct cyttsp4_core_data *cd, u8 scantype)
-{
-	int rc;
-
-	rc = cyttsp4_set_parameter(cd, CY_RAM_ID_SCAN_TYPE, 1, scantype);
-
-	return rc;
-}
-
-static u8 _cyttsp4_generate_new_scantype(struct cyttsp4_core_data *cd)
-{
-	u8 new_scantype = cd->default_scantype;
-
-	if (cd->apa_mc_en)
-		new_scantype |= CY_SCAN_TYPE_APA_MC;
-	if (cd->glove_en)
-		new_scantype |= CY_SCAN_TYPE_GLOVE;
-	if (cd->stylus_en)
-		new_scantype |= CY_SCAN_TYPE_STYLUS;
-	if (cd->proximity_en)
-		new_scantype |= CY_SCAN_TYPE_PROXIMITY;
-
-	return new_scantype;
-}
-
-static int cyttsp4_set_new_scan_type(struct cyttsp4_core_data *cd,
-		u8 scan_type, bool enable)
-{
-	int inc = enable ? 1 : -1;
-	int *en;
-	int rc;
-	u8 new_scantype;
-
-	switch (scan_type) {
-	case CY_ST_GLOVE:
-		en = &cd->glove_en;
-		break;
-	case CY_ST_STYLUS:
-		en = &cd->stylus_en;
-		break;
-	case CY_ST_PROXIMITY:
-		en = &cd->proximity_en;
-		break;
-	case CY_ST_APA_MC:
-		en = &cd->apa_mc_en;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	*en += inc;
-
-	new_scantype = _cyttsp4_generate_new_scantype(cd);
-
-	rc = cyttsp4_set_scantype(cd, new_scantype);
-	if (rc)
-		*en -= inc;
-
-	return rc;
-}
-
-static int cyttsp4_request_enable_scan_type_(struct cyttsp4_device *ttsp,
-		u8 scan_type)
+		size_t return_buf_size, int timeout)
 {
 	struct cyttsp4_core *core = ttsp->core;
 	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
 
-	return cyttsp4_set_new_scan_type(cd, scan_type, true);
+	return request_exec_cmd(cd, mode, cmd_buf, cmd_size,
+			return_buf, return_buf_size, timeout);
 }
-
-static int cyttsp4_request_disable_scan_type_(struct cyttsp4_device *ttsp,
-		u8 scan_type)
-{
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-
-	return cyttsp4_set_new_scan_type(cd, scan_type, false);
-}
-
-static int cyttsp4_read_config_block(struct cyttsp4_core_data *cd, u8 ebid,
-		u16 row, u8 *data, u16 length)
-{
-	u8 command_buf[CY_CMD_CAT_READ_CFG_BLK_CMD_SZ];
-	u8 *return_buf;
-	int return_buf_sz;
-	u16 crc;
-	int rc;
-
-	/* Allocate buffer for read config block command response
-	 * Header(5) + Data(length) + CRC(2)
-	 */
-	return_buf_sz = CY_CMD_CAT_READ_CFG_BLK_RET_SZ + length;
-	return_buf = kmalloc(return_buf_sz, GFP_KERNEL);
-	if (!return_buf) {
-		dev_err(cd->dev, "%s: Cannot allocate buffer\n",
-			__func__);
-		rc = -ENOMEM;
-		goto exit;
-	}
-
-	command_buf[0] = CY_CMD_CAT_READ_CFG_BLK;
-	command_buf[1] = HI_BYTE(row);
-	command_buf[2] = LO_BYTE(row);
-	command_buf[3] = HI_BYTE(length);
-	command_buf[4] = LO_BYTE(length);
-	command_buf[5] = ebid;
-
-	rc = cyttsp4_exec_cmd(cd, CY_MODE_CAT,
-			command_buf, CY_CMD_CAT_READ_CFG_BLK_CMD_SZ,
-			return_buf, return_buf_sz,
-			CY_COMMAND_COMPLETE_TIMEOUT);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error executing command r=%d\n",
-			__func__, rc);
-		goto free_buffer;
-	}
-
-	crc = cyttsp4_calc_app_crc(
-		&return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_HDR_SZ], length);
-
-	/* Validate response */
-	if (return_buf[0] != CY_CMD_STATUS_SUCCESS
-			|| return_buf[1] != ebid
-			|| return_buf[2] != HI_BYTE(length)
-			|| return_buf[3] != LO_BYTE(length)
-			|| return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_HDR_SZ
-				+ length] != HI_BYTE(crc)
-			|| return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_HDR_SZ
-				+ length + 1] != LO_BYTE(crc)) {
-		dev_err(cd->dev, "%s: Fail executing command\n",
-				__func__);
-		rc = -EINVAL;
-		goto free_buffer;
-	}
-
-	memcpy(data, &return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_HDR_SZ], length);
-
-	cyttsp4_pr_buf(cd->dev, cd->pr_buf, data, length, "read_config_block");
-
-free_buffer:
-	kfree(return_buf);
-exit:
-	return rc;
-}
-
-static int cyttsp4_write_config_block(struct cyttsp4_core_data *cd, u8 ebid,
-		u16 row, const u8 *data, u16 length)
-{
-	u8 return_buf[CY_CMD_CAT_WRITE_CFG_BLK_RET_SZ];
-	u8 *command_buf;
-	int command_buf_sz;
-	u16 crc;
-	int rc;
-
-	/* Allocate buffer for write config block command
-	 * Header(6) + Data(length) + Security Key(8) + CRC(2)
-	 */
-	command_buf_sz = CY_CMD_CAT_WRITE_CFG_BLK_CMD_SZ + length
-		+ sizeof(security_key);
-	command_buf = kmalloc(command_buf_sz, GFP_KERNEL);
-	if (!command_buf) {
-		dev_err(cd->dev, "%s: Cannot allocate buffer\n",
-			__func__);
-		rc = -ENOMEM;
-		goto exit;
-	}
-
-	crc = cyttsp4_calc_app_crc(data, length);
-
-	command_buf[0] = CY_CMD_CAT_WRITE_CFG_BLK;
-	command_buf[1] = HI_BYTE(row);
-	command_buf[2] = LO_BYTE(row);
-	command_buf[3] = HI_BYTE(length);
-	command_buf[4] = LO_BYTE(length);
-	command_buf[5] = ebid;
-
-	command_buf[CY_CMD_CAT_WRITE_CFG_BLK_CMD_HDR_SZ + length
-		+ sizeof(security_key)] = HI_BYTE(crc);
-	command_buf[CY_CMD_CAT_WRITE_CFG_BLK_CMD_HDR_SZ + 1 + length
-		+ sizeof(security_key)] = LO_BYTE(crc);
-
-	memcpy(&command_buf[CY_CMD_CAT_WRITE_CFG_BLK_CMD_HDR_SZ], data,
-		length);
-	memcpy(&command_buf[CY_CMD_CAT_WRITE_CFG_BLK_CMD_HDR_SZ + length],
-		security_key, sizeof(security_key));
-
-	cyttsp4_pr_buf(cd->dev, cd->pr_buf, command_buf, command_buf_sz,
-		"write_config_block");
-
-	rc = cyttsp4_exec_cmd(cd, CY_MODE_CAT,
-			command_buf, command_buf_sz,
-			return_buf, CY_CMD_CAT_WRITE_CFG_BLK_RET_SZ,
-			CY_COMMAND_COMPLETE_TIMEOUT);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error executing command r=%d\n",
-			__func__, rc);
-		goto free_buffer;
-	}
-
-	/* Validate response */
-	if (return_buf[0] != CY_CMD_STATUS_SUCCESS
-			|| return_buf[1] != ebid
-			|| return_buf[2] != HI_BYTE(length)
-			|| return_buf[3] != LO_BYTE(length)) {
-		dev_err(cd->dev, "%s: Fail executing command\n",
-				__func__);
-		rc = -EINVAL;
-		goto free_buffer;
-	}
-
-free_buffer:
-	kfree(command_buf);
-exit:
-	return rc;
-}
-
-static int cyttsp4_get_config_row_size(struct cyttsp4_core_data *cd,
-		u16 *config_row_size)
-{
-	u8 command_buf[CY_CMD_CAT_GET_CFG_ROW_SIZE_CMD_SZ];
-	u8 return_buf[CY_CMD_CAT_GET_CFG_ROW_SIZE_RET_SZ];
-	int rc;
-
-	command_buf[0] = CY_CMD_CAT_GET_CFG_ROW_SZ;
-
-	rc = cyttsp4_exec_cmd(cd, CY_MODE_CAT,
-			command_buf, CY_CMD_CAT_GET_CFG_ROW_SIZE_CMD_SZ,
-			return_buf, CY_CMD_CAT_GET_CFG_ROW_SIZE_RET_SZ,
-			CY_COMMAND_COMPLETE_TIMEOUT);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error executing command r=%d\n",
-			__func__, rc);
-		goto exit;
-	}
-
-	*config_row_size = get_unaligned_be16(&return_buf[0]);
-
-exit:
-	return rc;
-}
-
-static int cyttsp4_request_config_row_size_(struct cyttsp4_device *ttsp,
-		u16 *config_row_size)
-{
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-
-	return cyttsp4_get_config_row_size(cd, config_row_size);
-}
-
-static int cyttsp4_verify_config_block_crc(struct cyttsp4_core_data *cd,
-		u8 ebid, u16 *calc_crc, u16 *stored_crc, bool *match)
-{
-	u8 command_buf[CY_CMD_CAT_VERIFY_CFG_BLK_CRC_CMD_SZ];
-	u8 return_buf[CY_CMD_CAT_VERIFY_CFG_BLK_CRC_RET_SZ];
-	int rc;
-
-	command_buf[0] = CY_CMD_CAT_VERIFY_CFG_BLK_CRC;
-	command_buf[1] = ebid;
-
-	rc = cyttsp4_exec_cmd(cd, CY_MODE_CAT,
-			command_buf, CY_CMD_CAT_VERIFY_CFG_BLK_CRC_CMD_SZ,
-			return_buf, CY_CMD_CAT_VERIFY_CFG_BLK_CRC_RET_SZ,
-			CY_COMMAND_COMPLETE_TIMEOUT);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error executing command r=%d\n",
-			__func__, rc);
-		goto exit;
-	}
-
-	*calc_crc = get_unaligned_be16(&return_buf[1]);
-	*stored_crc = get_unaligned_be16(&return_buf[3]);
-	if (match)
-		*match = !return_buf[0];
-exit:
-	return rc;
-}
-
-static int cyttsp4_get_config_block_crc(struct cyttsp4_core_data *cd,
-		u8 ebid, u16 *crc)
-{
-	u8 command_buf[CY_CMD_OP_GET_CFG_BLK_CRC_CMD_SZ];
-	u8 return_buf[CY_CMD_OP_GET_CFG_BLK_CRC_RET_SZ];
-	int rc;
-
-	command_buf[0] = CY_CMD_OP_GET_CRC;
-	command_buf[1] = ebid;
-
-	rc = cyttsp4_exec_cmd(cd, CY_MODE_OPERATIONAL,
-			command_buf, CY_CMD_OP_GET_CFG_BLK_CRC_CMD_SZ,
-			return_buf, CY_CMD_OP_GET_CFG_BLK_CRC_RET_SZ,
-			CY_COMMAND_COMPLETE_TIMEOUT);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error executing command r=%d\n",
-			__func__, rc);
-		goto exit;
-	}
-
-	/* Validate response */
-	if (return_buf[0] != CY_CMD_STATUS_SUCCESS) {
-		dev_err(cd->dev, "%s: Fail executing command\n",
-				__func__);
-		rc = -EINVAL;
-		goto exit;
-	}
-
-	*crc = get_unaligned_be16(&return_buf[1]);
-
-exit:
-	return rc;
-}
-
-static int cyttsp4_get_ttconfig_version(struct cyttsp4_core_data *cd,
-		u16 *version)
-{
-	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	u8 data[CY_TTCONFIG_VERSION_OFFSET + CY_TTCONFIG_VERSION_SIZE];
-	int rc;
-	bool ready;
-
-	mutex_lock(&cd->system_lock);
-	ready = si->ready;
-	mutex_unlock(&cd->system_lock);
-
-	if (!ready) {
-		rc  = -ENODEV;
-		goto exit;
-	}
-
-	rc = cyttsp4_read_config_block(cd, CY_TCH_PARM_EBID,
-			CY_TTCONFIG_VERSION_ROW, data, sizeof(data));
-	if (rc) {
-		dev_err(cd->dev, "%s: Error on read config block\n",
-			__func__);
-		goto exit;
-	}
-
-	*version = GET_FIELD16(si, &data[CY_TTCONFIG_VERSION_OFFSET]);
-
-exit:
-	return rc;
-}
-
-static int cyttsp4_get_config_length(struct cyttsp4_core_data *cd, u8 ebid,
-		u16 *length, u16 *max_length)
-{
-	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	u8 data[CY_CONFIG_LENGTH_INFO_SIZE];
-	int rc;
-	bool ready;
-
-	mutex_lock(&cd->system_lock);
-	ready = si->ready;
-	mutex_unlock(&cd->system_lock);
-
-	if (!ready) {
-		rc  = -ENODEV;
-		goto exit;
-	}
-
-	rc = cyttsp4_read_config_block(cd, ebid, CY_CONFIG_LENGTH_INFO_OFFSET,
-			data, sizeof(data));
-	if (rc) {
-		dev_err(cd->dev, "%s: Error on read config block\n",
-			__func__);
-		goto exit;
-	}
-
-	*length = GET_FIELD16(si, &data[CY_CONFIG_LENGTH_OFFSET]);
-	*max_length = GET_FIELD16(si, &data[CY_CONFIG_MAXLENGTH_OFFSET]);
-
-exit:
-	return rc;
-}
-
-static int cyttsp4_write_config_common(struct cyttsp4_core_data *cd, u8 ebid,
-		u16 offset, u8 *data, u16 length)
-{
-	u16 cur_block, cur_off, end_block, end_off;
-	int copy_len;
-	u16 config_row_size = 0;
-	u8 *row_data = NULL;
-	int rc;
-
-	rc = cyttsp4_get_config_row_size(cd, &config_row_size);
-	if (rc) {
-		dev_err(cd->dev, "%s: Cannot get config row size\n",
-			__func__);
-		goto exit;
-	}
-
-	cur_block = offset / config_row_size;
-	cur_off = offset % config_row_size;
-
-	end_block = (offset + length) / config_row_size;
-	end_off = (offset + length) % config_row_size;
-
-	/* Check whether we need to fetch the whole block first */
-	if (cur_off == 0)
-		goto no_offset;
-
-	row_data = kmalloc(config_row_size, GFP_KERNEL);
-	if (!row_data) {
-		dev_err(cd->dev, "%s: Cannot allocate buffer\n", __func__);
-		rc = -ENOMEM;
-		goto exit;
-	}
-
-	copy_len = (cur_block == end_block) ?
-		length : config_row_size - cur_off;
-
-	/* Read up to current offset, append the new data and write it back */
-	rc = cyttsp4_read_config_block(cd, ebid, cur_block, row_data, cur_off);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error on read config block\n", __func__);
-		goto free_row_data;
-	}
-
-	memcpy(&row_data[cur_off], data, copy_len);
-
-	rc = cyttsp4_write_config_block(cd, ebid, cur_block, row_data,
-			cur_off + copy_len);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error on initial write config block\n",
-			__func__);
-		goto free_row_data;
-	}
-
-	data += copy_len;
-	cur_off = 0;
-	cur_block++;
-
-no_offset:
-	while (cur_block < end_block) {
-		rc = cyttsp4_write_config_block(cd, ebid, cur_block, data,
-				config_row_size);
-		if (rc) {
-			dev_err(cd->dev, "%s: Error on write config block\n",
-				__func__);
-			goto free_row_data;
-		}
-
-		data += config_row_size;
-		cur_block++;
-	}
-
-	/* Last block */
-	if (cur_block == end_block) {
-		rc = cyttsp4_write_config_block(cd, ebid, end_block, data,
-				end_off);
-		if (rc) {
-			dev_err(cd->dev, "%s: Error on last write config block\n",
-				__func__);
-			goto free_row_data;
-		}
-	}
-
-free_row_data:
-	kfree(row_data);
-exit:
-	return rc;
-}
-
-static int cyttsp4_write_config(struct cyttsp4_core_data *cd, u8 ebid,
-		u16 offset, u8 *data, u16 length) {
-	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	u16 crc_new, crc_old;
-	u16 crc_offset;
-	u16 conf_len;
-	u8 crc_data[2];
-	int rc;
-	bool ready;
-
-	mutex_lock(&cd->system_lock);
-	ready = si->ready;
-	mutex_unlock(&cd->system_lock);
-
-	if (!ready) {
-		rc  = -ENODEV;
-		goto exit;
-	}
-
-	/* CRC is stored at config max length offset */
-	rc = cyttsp4_get_config_length(cd, ebid, &conf_len, &crc_offset);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error on get config length\n",
-			__func__);
-		goto exit;
-	}
-
-	/* Allow CRC update also */
-	if (offset + length > crc_offset + 2) {
-		dev_err(cd->dev, "%s: offset + length exceeds max length(%d)\n",
-			__func__, crc_offset + 2);
-		rc = -EINVAL;
-		goto exit;
-	}
-
-	rc = cyttsp4_write_config_common(cd, ebid, offset, data, length);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error on write config\n",
-			__func__);
-		goto exit;
-	}
-
-	/* Verify config block CRC */
-	rc = cyttsp4_verify_config_block_crc(cd, ebid,
-			&crc_new, &crc_old, NULL);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error on verify config block crc\n",
-			__func__);
-		goto exit;
-	}
-
-	dev_vdbg(cd->dev, "%s: crc_new:%04X crc_old:%04X\n",
-		__func__, crc_new, crc_old);
-
-	if (crc_new == crc_old) {
-		dev_vdbg(cd->dev, "%s: Calculated crc matches stored crc\n",
-			__func__);
-		goto exit;
-	}
-
-	PUT_FIELD16(si, crc_new, crc_data);
-
-	rc = cyttsp4_write_config_common(cd, ebid, crc_offset, crc_data, 2);
-	if (rc) {
-		dev_err(cd->dev, "%s: Error on write config crc\n",
-			__func__);
-		goto exit;
-	}
-
-exit:
-	return rc;
-}
-
-static int cyttsp4_request_write_config_(struct cyttsp4_device *ttsp, u8 ebid,
-		u16 offset, u8 *data, u16 length) {
-	struct cyttsp4_core *core = ttsp->core;
-	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
-
-	return cyttsp4_write_config(cd, ebid, offset, data, length);
-}
-
-#ifdef CYTTSP4_WATCHDOG_NULL_CMD
-static void cyttsp4_watchdog_work(struct work_struct *work)
-{
-	struct cyttsp4_core_data *cd =
-		container_of(work, struct cyttsp4_core_data, watchdog_work);
-	u8 cmd_buf[CY_CMD_OP_NULL_CMD_SZ];
-	bool restart = false;
-	int rc;
-
-	rc = request_exclusive(cd, cd->core, 1);
-	if (rc < 0) {
-		dev_vdbg(cd->dev, "%s: fail get exclusive ex=%p own=%p\n",
-				__func__, cd->exclusive_dev, cd->core);
-		goto exit;
-	}
-
-	cmd_buf[0] = CY_CMD_OP_NULL;
-	rc = cyttsp4_exec_cmd(cd, cd->mode,
-			cmd_buf, CY_CMD_OP_NULL_CMD_SZ,
-			NULL, CY_CMD_OP_NULL_RET_SZ,
-			CY_COMMAND_COMPLETE_TIMEOUT);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: Watchdog NULL cmd failed.\n", __func__);
-		restart = true;
-	}
-
-	if (release_exclusive(cd, cd->core) < 0)
-		dev_err(cd->dev, "%s: fail to release exclusive\n", __func__);
-	else
-		dev_vdbg(cd->dev, "%s: pass release exclusive\n", __func__);
-exit:
-	if (restart)
-		cyttsp4_queue_startup(cd);
-	else
-		cyttsp4_start_wd_timer(cd);
-}
-#else
-static void cyttsp4_watchdog_work(struct work_struct *work)
-{
-	struct cyttsp4_core_data *cd =
-		container_of(work, struct cyttsp4_core_data, watchdog_work);
-	u8 mode[2];
-	bool restart = false;
-	int rc;
-
-	if (cd == NULL) {
-		dev_err(cd->dev, "%s: NULL context pointer\n", __func__);
-		return;
-	}
-
-	mutex_lock(&cd->system_lock);
-	rc = cyttsp4_adap_read(cd, CY_REG_BASE, &mode, sizeof(mode));
-	if (rc) {
-		dev_err(cd->dev, "%s: failed to access device r=%d\n",
-			__func__, rc);
-		restart = true;
-		goto exit;
-	}
-
-	if (IS_BOOTLOADER(mode[0], mode[1])) {
-		dev_err(cd->dev, "%s: device found in bootloader mode\n",
-			__func__);
-		restart = true;
-		goto exit;
-	}
-exit:
-	if (restart)
-		cyttsp4_queue_startup_(cd);
-	else
-		cyttsp4_start_wd_timer(cd);
-	mutex_unlock(&cd->system_lock);
-}
-#endif
 
 static int cyttsp4_request_stop_wd_(struct cyttsp4_device *ttsp)
 {
@@ -2736,21 +1533,241 @@ static int cyttsp4_request_stop_wd_(struct cyttsp4_device *ttsp)
 	return 0;
 }
 
-static int _cyttsp4_put_device_into_deep_sleep(struct cyttsp4_core_data *cd,
-		u8 hst_mode_reg)
+static int cyttsp4_request_calibration_(struct cyttsp4_device *ttsp,
+					u16 old_config_ver)
 {
+	struct cyttsp4_core *core = ttsp->core;
+	struct cyttsp4_core_data *cd = dev_get_drvdata(&core->dev);
+
+	cd->fw_updated = true;
+	cd->old_config_ver = old_config_ver;
+	return 0;
+}
+
+static u8 cmd_read_config_ver[CY_CMD_CAT_READ_CFG_BLK_CMD_SZ] = {
+	CY_CMD_CAT_READ_CFG_BLK,
+	0x00, 0x00, /*row offset*/
+	0x00, 0x0A, /*read length, the first 8 bytes reserved,
+				the last 2 bytes is CONFIG_VER*/
+	CY_EBID
+};
+
+static int cyttsp4_cat_get_config_ver(struct cyttsp4_core_data *cd)
+{
+	struct cyttsp4_pcfg *pcfg = cd->sysinfo.si_ptrs.pcfg;
+	struct cyttsp4_cydata *cydata = cd->sysinfo.si_ptrs.cydata;
+	struct device *dev = cd->dev;
+	u8 return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_SZ + 0x0A];
+	u8 cfg_h, cfg_l;
 	int rc;
 
-	hst_mode_reg |= CY_HST_SLEEP;
+	if (pcfg == NULL) {
+		dev_err(cd->dev, "%s: pcfg memory not alloc.\n", __func__);
+		rc = -ENOMEM;
+		goto config_ver_error;
+	}
 
-	dev_vdbg(cd->dev, "%s: write DEEP SLEEP...\n", __func__);
-	rc = cyttsp4_adap_write(cd, CY_REG_BASE, &hst_mode_reg,
-			sizeof(hst_mode_reg));
+	rc = request_exec_cmd(cd, CY_MODE_CAT,
+			(u8 *)cmd_read_config_ver, sizeof(cmd_read_config_ver),
+			return_buf, sizeof(return_buf),
+			CY_CORE_COMMAND_COMPLETE_TIMEOUT);
+
+	if (rc < 0) {
+		dev_err(dev, "%s: exec cmd error.\n", __func__);
+		goto config_ver_error;
+	}
+
+	if (return_buf[CY_CMD_OUT_STATUS_OFFSET] != CY_CMD_STATUS_SUCCESS) {
+		dev_err(dev, "%s: completion status failure.\n", __func__);
+		rc = -EAGAIN;
+		goto config_ver_error;
+	}
+
+	if (cydata->device_info & CY_ENDIANESS_MASK) {/*LSB is lowest byte*/
+		cfg_h = return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_HDR_SZ + 0x09];
+		cfg_l = return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_HDR_SZ + 0x08];
+	} else {
+		cfg_h = return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_HDR_SZ + 0x08];
+		cfg_l = return_buf[CY_CMD_CAT_READ_CFG_BLK_RET_HDR_SZ + 0x09];
+	}
+
+	pcfg->config_ver = merge_bytes(cfg_h, cfg_l);
+	dev_dbg(dev, "%s: config_ver=0x%x.\n", __func__, pcfg->config_ver);
+
+config_ver_error:
+	return rc;
+}
+
+static int cyttsp4_calibrate_idac(struct cyttsp4_core_data *cd)
+{
+	struct device *dev = cd->dev;
+	u8 cmd_buf[CY_CMD_CAT_IDACS_CMD_SZ];
+	u8 return_buf[CY_CMD_CAT_IDACS_RET_SZ];
+	int rc;
+
+	/* Do calibration with Mutual Capacitance Fine mode */
+	cmd_buf[0] = CY_CMD_CAT_CALIBRATE_IDACS;
+	cmd_buf[1] = CY_CAT_PARA_IDACS_MULTUAL_CAP_FINE;
+
+	rc = request_exec_cmd(cd, CY_MODE_CAT,
+			cmd_buf, sizeof(cmd_buf),
+			return_buf, sizeof(return_buf),
+			CY_CORE_IDAC_CALIBRATION_TIMEOUT);
+
+	if (rc < 0) {
+		dev_err(dev, "%s: Fail to do Multual-Cap IDACs calibration.\n",
+				__func__);
+		goto idac_calibration_error;
+	}
+
+	if (return_buf[0] != 0) {
+		rc = -EINVAL;
+		goto idac_calibration_error;
+	}
+
+	/* Do calibration with Self Capacitance mode */
+	cmd_buf[0] = CY_CMD_CAT_CALIBRATE_IDACS;
+	cmd_buf[1] = CY_CAT_PARA_IDACS_SELF_CAP;
+
+	rc = request_exec_cmd(cd, CY_MODE_CAT,
+			cmd_buf, sizeof(cmd_buf),
+			return_buf, sizeof(return_buf),
+			CY_CORE_IDAC_CALIBRATION_TIMEOUT);
+
+	if (rc < 0) {
+		dev_err(dev, "%s: Fail to do Self-Cap IDACs calibration.\n",
+				__func__);
+		goto idac_calibration_error;
+	}
+
+	if (return_buf[0] != 0)
+		rc = -EINVAL;
+
+idac_calibration_error:
+	return rc;
+}
+
+static ssize_t cyttsp4_get_idac_data(struct cyttsp4_core_data *cd,
+		size_t read_len, u8 data_id, char *buf)
+{
+	u8 cmd_buf[CY_CMD_CAT_RET_IDACS_DATA_CMD_SZ];
+	u8 return_buf[CY_CMD_CAT_RET_IDACS_DATA_RET_SZ];
+	u8 data_start = cd->sysinfo.si_ofs.cmd_ofs + 1
+			+ CY_CMD_CAT_RET_IDACS_DATA_RET_SZ;
+	int read_left, read_offset;
+	int read_byte;
+	int rc = 0;
+
+	read_offset = 0;
+	read_left = read_len;
+	while (read_left >0) {
+		/* Retrieve idac data */
+		cmd_buf[0] = CY_CMD_CAT_RETRIEVE_DATA_STRUCTURE;
+		cmd_buf[1] = (u8)((read_offset >> 8) & 0xFF);
+		cmd_buf[2] = (u8)(read_offset & 0xFF);
+		cmd_buf[3] = (u8)((read_left >> 8) & 0xFF);
+		cmd_buf[4] = (u8)(read_left & 0xFF);
+		cmd_buf[5] = data_id;
+		rc = request_exec_cmd(cd, CY_MODE_CAT,
+				cmd_buf, CY_CMD_CAT_RET_IDACS_DATA_CMD_SZ,
+				return_buf, CY_CMD_CAT_RET_IDACS_DATA_RET_SZ,
+				CY_CORE_COMMAND_COMPLETE_TIMEOUT);
+
+		if (rc < 0) {
+			dev_err(cd->dev, "%s: Exec cmd error, rc=%d\n",
+					__func__, rc);
+			goto exit;
+		}
+
+		if (return_buf[0] != CY_CMD_STATUS_SUCCESS) {
+			dev_err(cd->dev, "%s: Completion status error, rc=%d\n",
+					__func__, rc);
+			rc = -EINVAL;
+			goto exit;
+		}
+
+		if (read_left >= I2C_BUF_MAX_SIZE - data_start) {
+			read_byte = I2C_BUF_MAX_SIZE - data_start;
+		} else {
+			read_byte = read_left;
+		}
+
+		rc = cyttsp4_core_read(cd, CY_MODE_CAT, data_start,
+					buf+read_offset, read_byte);
+		if (rc < 0) {
+			dev_err(cd->dev, "%s: Read data error, rc=%d\n",
+					__func__, rc);
+			goto exit;
+		}
+
+		read_offset += read_byte;
+		read_left -= read_byte;
+	}
+exit:
+	return rc;
+}
+
+static int cyttsp4_set_scantype(struct cyttsp4_core_data *cd, u8 scan_type)
+{
+	u8 cmd_buf[CY_CMD_OP_SET_PARA_CMD_SZ];
+	u8 return_buf[CY_CMD_OP_SET_PARA_RET_SZ];
+	int rc;
+
+	cmd_buf[0] = CY_CMD_OP_SET_PARA;
+	cmd_buf[1] = CY_OP_PARA_SCAN_TYPE;
+	cmd_buf[2] = CY_OP_PARA_SCAN_TYPE_SZ;
+	cmd_buf[3] = scan_type;
+
+	rc = request_exec_cmd(cd, CY_MODE_OPERATIONAL,
+			cmd_buf, sizeof(cmd_buf),
+			return_buf, sizeof(return_buf),
+			CY_CORE_COMMAND_COMPLETE_TIMEOUT);
+
+	dev_dbg(cd->dev, "%s: return_buf=0x%x,0x%x\n", __func__,
+		return_buf[0],  return_buf[1]);
+
+	return rc;
+}
+
+static int cyttsp4_core_sleep_(struct cyttsp4_core_data *cd)
+{
+	int rc = 0;
+	u8 mode;
+
+	cyttsp4_stop_wd_timer(cd);
+
+	/* Wait until currently running IRQ handler exits and disable IRQ */
+	disable_irq(cd->irq);
+
+	/* Already in sleep mode? */
+	mutex_lock(&cd->system_lock);
+	if (cd->sleep_state == SS_SLEEP_ON) {
+		goto exit;
+	}
+	cd->sleep_state = SS_SLEEPING;
+
+	rc = cyttsp4_adap_read(cd->core->adap, CY_REG_BASE, &mode,
+			sizeof(mode));
+	if (rc) {
+		dev_err(cd->dev, "%s: Fail read adapter r=%d\n", __func__, rc);
+		goto exit;
+	}
+
+	if (IS_BOOTLOADER(mode)) {
+		dev_err(cd->dev, "%s: Device in BOOTLADER mode.\n", __func__);
+		rc = -EINVAL;
+		goto exit;
+	}
+	mode |= CY_HST_SLEEP;
+
+	rc = cyttsp4_adap_write(cd->core->adap, CY_REG_BASE, &mode,
+			sizeof(mode));
 	if (rc) {
 		dev_err(cd->dev, "%s: Fail write adapter r=%d\n", __func__, rc);
-		return -EINVAL;
+		goto exit;
 	}
-	dev_vdbg(cd->dev, "%s: write DEEP SLEEP succeeded\n", __func__);
+
+	dev_info(cd->dev, "%s: Touch DEEP SLEEP.\n", __func__);
 
 	if (cd->pdata->power) {
 		dev_dbg(cd->dev, "%s: Power down HW\n", __func__);
@@ -2762,118 +1779,11 @@ static int _cyttsp4_put_device_into_deep_sleep(struct cyttsp4_core_data *cd,
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: HW Power down fails r=%d\n",
 				__func__, rc);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int _cyttsp4_put_device_into_easy_wakeup(struct cyttsp4_core_data *cd)
-{
-	u8 command_buf[CY_CMD_OP_WAIT_FOR_EVENT_CMD_SZ];
-	int rc;
-
-	if (!IS_TTSP_VER_GE(&cd->sysinfo, 2, 5))
-		return -EINVAL;
-
-	command_buf[0] = CY_CMD_OP_WAIT_FOR_EVENT;
-	command_buf[1] = cd->easy_wakeup_gesture;
-
-	rc = _cyttsp4_exec_cmd(cd, CY_MODE_OPERATIONAL, command_buf,
-			CY_CMD_OP_WAIT_FOR_EVENT_CMD_SZ);
-	cd->int_status &= ~CY_INT_EXEC_CMD;
-	if (rc)
-		dev_err(cd->dev, "%s: Error executing command r=%d\n",
-			__func__, rc);
-
-	return rc;
-}
-
-static int _cyttsp4_wait_for_refresh_cycle(struct cyttsp4_core_data *cd,
-		int cycle)
-{
-	int active_refresh_cycle_ms;
-
-	if (cd->active_refresh_cycle_ms)
-		active_refresh_cycle_ms = cd->active_refresh_cycle_ms;
-	else
-		active_refresh_cycle_ms = 20;
-
-	msleep(cycle * active_refresh_cycle_ms);
-
-	return 0;
-}
-
-static int _cyttsp4_put_device_into_sleep(struct cyttsp4_core_data *cd,
-		u8 hst_mode_reg)
-{
-	int rc;
-
-	if (IS_DEEP_SLEEP_CONFIGURED(cd->easy_wakeup_gesture))
-		rc = _cyttsp4_put_device_into_deep_sleep(cd, hst_mode_reg);
-	else
-		rc = _cyttsp4_put_device_into_easy_wakeup(cd);
-
-	return rc;
-}
-
-static int cyttsp4_core_sleep_(struct cyttsp4_core_data *cd)
-{
-	u8 mode[2];
-	int rc = 0;
-
-	cyttsp4_stop_wd_timer(cd);
-
-	/* Wait until currently running IRQ handler exits and disable IRQ */
-	disable_irq(cd->irq);
-
-	mutex_lock(&cd->system_lock);
-	/* Already in sleep mode? */
-	if (cd->sleep_state == SS_SLEEP_ON)
-		goto exit;
-
-	cd->sleep_state = SS_SLEEPING;
-
-	rc = cyttsp4_adap_read(cd, CY_REG_BASE, &mode, sizeof(mode));
-	if (rc) {
-		dev_err(cd->dev, "%s: Fail read adapter r=%d\n", __func__, rc);
 		goto exit;
 	}
 
-	if (IS_BOOTLOADER(mode[0], mode[1])) {
-		dev_err(cd->dev, "%s: Device in BOOTLADER mode.\n", __func__);
-		rc = -EINVAL;
-		goto exit;
-	}
-
-	/* Deep sleep is only allowed in Operating mode */
-	if (GET_HSTMODE(mode[0]) != CY_HST_OPERATE) {
-		dev_err(cd->dev, "%s: Device is not in Operating mode (%02X)\n",
-			__func__, GET_HSTMODE(mode[0]));
-		mutex_unlock(&cd->system_lock);
-		enable_irq(cd->irq);
-		/* Try switching to Operating mode */
-		rc = set_mode(cd, CY_MODE_OPERATIONAL);
-		disable_irq(cd->irq);
-		mutex_lock(&cd->system_lock);
-		if (rc < 0) {
-			dev_err(cd->dev, "%s: failed to set mode to Operational rc=%d\n",
-				__func__, rc);
-			cyttsp4_queue_startup_(cd);
-			rc = 0;
-			goto exit;
-		}
-
-		/* Get the new host mode register value */
-		rc = cyttsp4_adap_read(cd, CY_REG_BASE, &mode, sizeof(mode));
-		if (rc) {
-			dev_err(cd->dev, "%s: Fail read adapter r=%d\n",
-				__func__, rc);
-			goto exit;
-		}
-	}
-
-	rc = _cyttsp4_put_device_into_sleep(cd, mode[0]);
+	/* Give time to FW to sleep */
+	msleep(32);
 
 exit:
 	if (rc) {
@@ -2883,8 +1793,8 @@ exit:
 		cd->sleep_state = SS_SLEEP_ON;
 		cd->int_status |= CY_INT_IGNORE;
 	}
-
 	mutex_unlock(&cd->system_lock);
+
 	enable_irq(cd->irq);
 
 	return rc;
@@ -2894,8 +1804,7 @@ static int cyttsp4_core_sleep(struct cyttsp4_core_data *cd)
 {
 	int rc;
 
-	rc = request_exclusive(cd, cd->core,
-			CY_CORE_SLEEP_REQUEST_EXCLUSIVE_TIMEOUT);
+	rc = request_exclusive(cd, cd->core, CY_REQUEST_EXCLUSIVE_TIMEOUT);
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: fail get exclusive ex=%p own=%p\n",
 				__func__, cd->exclusive_dev, cd->core);
@@ -2909,79 +1818,17 @@ static int cyttsp4_core_sleep(struct cyttsp4_core_data *cd)
 	else
 		dev_vdbg(cd->dev, "%s: pass release exclusive\n", __func__);
 
-	/* Give time to FW to sleep */
-	_cyttsp4_wait_for_refresh_cycle(cd, 2);
-
 	return rc;
-}
-
-static int _cyttsp4_awake_device_from_deep_sleep(struct cyttsp4_core_data *cd,
-		int timeout_ms)
-{
-	struct device *dev = cd->dev;
-	u8 mode;
-	int t;
-	int rc;
-
-	cd->int_status |= CY_INT_AWAKE;
-
-	if (cd->pdata->power) {
-		/* Wake up using platform power function */
-		dev_dbg(dev, "%s: Power up HW\n", __func__);
-		rc = cd->pdata->power(cd->pdata, 1, dev, &cd->ignore_irq);
-	} else {
-		/* Initiate a read transaction to wake up */
-		rc = cyttsp4_adap_read(cd, CY_REG_BASE, &mode, sizeof(mode));
-	}
-	if (rc < 0) {
-		dev_err(dev, "%s: HW Power up fails r=%d\n", __func__, rc);
-		/* Initiate another read transaction to wake up */
-		rc = cyttsp4_adap_read(cd, CY_REG_BASE, &mode, sizeof(mode));
-	} else
-		dev_vdbg(cd->dev, "%s: HW power up succeeds\n", __func__);
-	mutex_unlock(&cd->system_lock);
-
-	t = wait_event_timeout(cd->wait_q,
-			(cd->int_status & CY_INT_AWAKE) == 0,
-			msecs_to_jiffies(timeout_ms));
-	mutex_lock(&cd->system_lock);
-	if (IS_TMO(t)) {
-		dev_dbg(dev, "%s: TMO waiting for wakeup\n", __func__);
-		cd->int_status &= ~CY_INT_AWAKE;
-		/* Perform a read transaction to check if device is awake */
-		rc = cyttsp4_adap_read(cd, CY_REG_BASE, &mode, sizeof(mode));
-		if (rc < 0 || GET_HSTMODE(mode) != CY_HST_OPERATE) {
-			dev_err(dev, "%s: Queueing startup\n", __func__);
-			/* Try starting up */
-			cyttsp4_queue_startup_(cd);
-		}
-	}
-
-	return rc;
-}
-
-static int _cyttsp4_awake_device(struct cyttsp4_core_data *cd)
-{
-	int timeout_ms;
-
-	if (cd->wake_initiated_by_device) {
-		cd->wake_initiated_by_device = 0;
-		/* To prevent sequential wake/sleep caused by ttsp modules */
-		msleep(20);
-		return 0;
-	}
-
-	if (IS_DEEP_SLEEP_CONFIGURED(cd->easy_wakeup_gesture))
-		timeout_ms = CY_CORE_WAKEUP_TIMEOUT;
-	else
-		timeout_ms = CY_CORE_WAKEUP_TIMEOUT * 4;
-
-	return _cyttsp4_awake_device_from_deep_sleep(cd, timeout_ms);
 }
 
 static int cyttsp4_core_wake_(struct cyttsp4_core_data *cd)
 {
+	struct device *dev = cd->dev;
 	int rc;
+	u8 mode;
+	int t;
+
+	dev_vdbg(cd->dev, "%s: enter...\n", __func__);
 
 	/* Already woken? */
 	mutex_lock(&cd->system_lock);
@@ -2989,15 +1836,48 @@ static int cyttsp4_core_wake_(struct cyttsp4_core_data *cd)
 		mutex_unlock(&cd->system_lock);
 		return 0;
 	}
-
 	cd->int_status &= ~CY_INT_IGNORE;
+	cd->int_status |= CY_INT_AWAKE;
 	cd->sleep_state = SS_WAKING;
 
-	rc = _cyttsp4_awake_device(cd);
+	if (cd->pdata->power) {
+		dev_dbg(dev, "%s: Power up HW\n", __func__);
+		rc = cd->pdata->power(cd->pdata, 1, dev, &cd->ignore_irq);
+	} else {
+		/* Initiate a read transaction to wake up */
+		rc = cyttsp4_adap_read(cd->core->adap, CY_REG_BASE, &mode,
+				sizeof(mode));
+	}
+	if (rc < 0) {
+		dev_err(dev, "%s: HW Power up fails r=%d\n",
+				__func__, rc);
 
+		/* Initiate another read transaction to wake up */
+		cyttsp4_adap_read(cd->core->adap, CY_REG_BASE, &mode,
+				sizeof(mode));
+	} else
+		dev_vdbg(cd->dev, "%s: HW power up succeeds\n",
+			__func__);
+	mutex_unlock(&cd->system_lock);
+
+	t = wait_event_timeout(cd->sleep_q,
+			(cd->int_status & CY_INT_AWAKE) == 0,
+			msecs_to_jiffies(CY_CORE_WAKEUP_TIMEOUT));
+	if (IS_TMO(t)) {
+		dev_err(dev, "%s: TMO waiting for wakeup\n", __func__);
+		mutex_lock(&cd->system_lock);
+		cd->int_status &= ~CY_INT_AWAKE;
+		mutex_unlock(&cd->system_lock);
+		/* Try starting up */
+		cyttsp4_queue_startup(cd);
+	} else
+		dev_info(cd->dev, "%s: Touch WAKEUP.\n", __func__);
+
+	mutex_lock(&cd->system_lock);
 	cd->sleep_state = SS_SLEEP_OFF;
 	mutex_unlock(&cd->system_lock);
 
+	/* Do not start watchdog in already woken state */
 	cyttsp4_start_wd_timer(cd);
 
 	return 0;
@@ -3007,8 +1887,7 @@ static int cyttsp4_core_wake(struct cyttsp4_core_data *cd)
 {
 	int rc;
 
-	rc = request_exclusive(cd, cd->core,
-			CY_CORE_REQUEST_EXCLUSIVE_TIMEOUT);
+	rc = request_exclusive(cd, cd->core, CY_REQUEST_EXCLUSIVE_TIMEOUT);
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: fail get exclusive ex=%p own=%p\n",
 				__func__, cd->exclusive_dev, cd->core);
@@ -3022,229 +1901,130 @@ static int cyttsp4_core_wake(struct cyttsp4_core_data *cd)
 	else
 		dev_vdbg(cd->dev, "%s: pass release exclusive\n", __func__);
 
-	/* If a startup queued in wake, wait it to finish */
-	wait_event_timeout(cd->wait_q, cd->startup_state == STARTUP_NONE,
-			msecs_to_jiffies(CY_CORE_RESET_AND_WAIT_TIMEOUT));
-
-	return rc;
-}
-
-static int cyttsp4_get_ttconfig_info(struct cyttsp4_core_data *cd)
-{
-	struct cyttsp4_sysinfo *si = &cd->sysinfo;
-	u16 length, max_length;
-	u16 version = 0;
-	u16 crc = 0;
-	int rc;
-
-	rc = set_mode(cd, CY_MODE_CAT);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to set mode to CAT rc=%d\n",
-			__func__, rc);
-		return rc;
-	}
-
-	rc = cyttsp4_get_ttconfig_version(cd, &version);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to get ttconfig version rc=%d\n",
-			__func__, rc);
-		return rc;
-	}
-
-	rc = cyttsp4_get_config_length(cd, CY_TCH_PARM_EBID,
-			&length, &max_length);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to get ttconfig length rc=%d\n",
-			__func__, rc);
-		return rc;
-	}
-
-	rc = set_mode(cd, CY_MODE_OPERATIONAL);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to set mode to Operational rc=%d\n",
-			__func__, rc);
-		return rc;
-	}
-
-	rc = cyttsp4_get_config_block_crc(cd, CY_TCH_PARM_EBID, &crc);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to get ttconfig crc rc=%d\n",
-			__func__, rc);
-		return rc;
-	}
-
-	si->ttconfig.version = version;
-	si->ttconfig.length = length;
-	si->ttconfig.max_length = max_length;
-	si->ttconfig.crc = crc;
-
-	dev_vdbg(cd->dev, "%s: TT Config Version:%04X Length:%d Max Length:%d CRC:%04X\n",
-		__func__, si->ttconfig.version, si->ttconfig.length,
-		si->ttconfig.length, si->ttconfig.crc);
-
-	return 0;
-}
-static int cyttsp4_get_active_refresh_cycle(struct cyttsp4_core_data *cd)
-{
-	int rc;
-	u32 value;
-
-	rc = cyttsp4_get_parameter(cd, CY_RAM_ID_REFRESH_INTERVAL, &value);
-	if (!rc)
-		cd->active_refresh_cycle_ms = (u8)value;
-
-	return rc;
-}
-
-static int cyttsp4_set_initial_scantype(struct cyttsp4_core_data *cd)
-{
-	u8 new_scantype;
-	int rc;
-
-	rc = cyttsp4_get_scantype(cd, &cd->default_scantype);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to get scantype rc=%d\n",
-			__func__, rc);
-		goto exit;
-	}
-
-	/* Disable proximity sensing by default */
-	cd->default_scantype &= ~CY_SCAN_TYPE_PROXIMITY;
-
-	new_scantype = _cyttsp4_generate_new_scantype(cd);
-
-	rc = cyttsp4_set_scantype(cd, new_scantype);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to set scantype rc=%d\n",
-			__func__, rc);
-		goto exit;
-	}
-exit:
 	return rc;
 }
 
 static int cyttsp4_startup_(struct cyttsp4_core_data *cd)
 {
-	int retry = CY_CORE_STARTUP_RETRY_COUNT;
+	struct atten_node *atten, *atten_n;
+	unsigned long flags;
+	long t;
 	int rc;
-	bool detected = false;
+	int i;
 
 	dev_dbg(cd->dev, "%s: enter...\n", __func__);
 
 	cyttsp4_stop_wd_timer(cd);
 
-reset:
-	if (retry != CY_CORE_STARTUP_RETRY_COUNT)
-		dev_dbg(cd->dev, "%s: Retry %d\n", __func__,
-			CY_CORE_STARTUP_RETRY_COUNT - retry);
-
 	/* reset hardware and wait for heartbeat */
 	rc = cyttsp4_reset_and_wait(cd);
-	if (rc < 0) {
+	if (rc < 0)
 		dev_err(cd->dev, "%s: Error on h/w reset r=%d\n", __func__, rc);
-		RETRY_OR_EXIT(retry--, reset, exit);
-	}
-
-	detected = true;
 
 	/* exit bl into sysinfo mode */
 	dev_vdbg(cd->dev, "%s: write exit ldr...\n", __func__);
 	mutex_lock(&cd->system_lock);
 	cd->int_status &= ~CY_INT_IGNORE;
 	cd->int_status |= CY_INT_MODE_CHANGE;
-	msleep(10);
-	rc = cyttsp4_adap_write(cd, CY_REG_BASE, (u8 *)ldr_exit,
-			sizeof(ldr_exit));
-	mutex_unlock(&cd->system_lock);
-	if (rc < 0) {
+	rc = cyttsp4_adap_write(cd->core->adap, CY_REG_BASE,
+		(u8 *)ldr_exit, sizeof(ldr_exit));
+	if (rc < 0)
 		dev_err(cd->dev, "%s: Fail write adap='%s' r=%d\n",
 			__func__, cd->core->adap->id, rc);
-		RETRY_OR_EXIT(retry--, reset, exit);
-	}
-
-	rc = cyttsp4_wait_sysinfo_mode(cd);
-	if (rc < 0) {
-		u8 buf[sizeof(ldr_err_app)];
-		int rc1;
-
-		/* Check for invalid/corrupted touch application */
-		rc1 = cyttsp4_adap_read(cd, CY_REG_BASE, buf,
-				sizeof(ldr_err_app));
-		if (rc1) {
-			dev_err(cd->dev, "%s: Fail read adap='%s' r=%d\n",
-				__func__, cd->core->adap->id, rc1);
-		} else if (!memcmp(buf, ldr_err_app, sizeof(ldr_err_app))) {
-			dev_err(cd->dev, "%s: Error launching touch application\n",
-				__func__);
-			mutex_lock(&cd->system_lock);
-			cd->invalid_touch_app = true;
-			mutex_unlock(&cd->system_lock);
-			goto exit_no_wd;
-		}
-
-		RETRY_OR_EXIT(retry--, reset, exit);
-	}
-
-	mutex_lock(&cd->system_lock);
-	cd->invalid_touch_app = false;
 	mutex_unlock(&cd->system_lock);
+
+	dev_vdbg(cd->dev, "%s: wait sysinfo...\n", __func__);
+	t = wait_event_timeout(cd->wait_q, cd->mode == CY_MODE_SYSINFO,
+		msecs_to_jiffies(CY_CORE_MODE_CHANGE_TIMEOUT));
+	if (IS_TMO(t)) {
+		dev_err(cd->dev, "%s: tmo waiting exit bl cd->mode=%d\n",
+				__func__, cd->mode);
+		mutex_lock(&cd->system_lock);
+		cd->int_status &= ~CY_INT_MODE_CHANGE;
+		mutex_unlock(&cd->system_lock);
+
+		cyttsp4_start_wd_timer(cd);
+
+		/*
+		 * Unable to switch to SYSINFO mode,
+		 * Corrupted FW may cause crash, exit here.
+		 */
+		return 0;
+	}
 
 	/* read sysinfo data */
 	dev_vdbg(cd->dev, "%s: get sysinfo regs..\n", __func__);
 	rc = cyttsp4_get_sysinfo_regs(cd);
-	if (rc < 0) {
+	if (rc < 0)
 		dev_err(cd->dev, "%s: failed to get sysinfo regs rc=%d\n",
 			__func__, rc);
-		RETRY_OR_EXIT(retry--, reset, exit);
-	}
 
-	rc = set_mode(cd, CY_MODE_OPERATIONAL);
+	set_mode(cd, cd->core, CY_HST_CAT, CY_MODE_CAT);
+	rc = cyttsp4_cat_get_config_ver(cd);
 	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to set mode to operational rc=%d\n",
+		dev_err(cd->dev, "%s: failed to get CAT config ver rc=%d\n",
 			__func__, rc);
-		RETRY_OR_EXIT(retry--, reset, exit);
+	} else {
+		dev_info(cd->dev, "%s: fw_updated=%d, %s=0x%x, %s=0x%x.\n",
+			__func__, cd->fw_updated,
+			"old_config_ver", cd->old_config_ver,
+			"config_ver", cd->sysinfo.si_ptrs.pcfg->config_ver);
+
+		if ((cd->pdata->use_auto_calibration) && (cd->fw_updated)) {
+			if (GET_FW_CONF(cd->old_config_ver) !=
+			GET_FW_CONF(cd->sysinfo.si_ptrs.pcfg->config_ver)) {
+				dev_info(cd->dev, "%s: Firmware calibration.\n",
+						__func__);
+				for (i = 0; i < 5; i++) {
+					rc = cyttsp4_calibrate_idac(cd);
+					if (rc < 0)
+						dev_err(cd->dev,
+							"%s:Calibration fail, rc=%d\n",
+							__func__, rc);
+					else
+						break;
+				}
+			}
+			cd->fw_updated = false;
+		}
 	}
 
-	rc = cyttsp4_set_initial_scantype(cd);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to get scantype rc=%d\n",
-			__func__, rc);
-		RETRY_OR_EXIT(retry--, reset, exit);
+	cyttsp4_start_wd_timer(cd);
+
+	/* switch to operational mode */
+	dev_vdbg(cd->dev, "%s: set mode cd->core=%p hst_mode=%02X mode=%d...\n",
+		__func__, cd->core, CY_HST_OPERATE, CY_MODE_OPERATIONAL);
+	set_mode(cd, cd->core, CY_HST_OPERATE, CY_MODE_OPERATIONAL);
+
+	/* restore glove mode if was enabled */
+	if (cd->scan_type > CY_OP_PARA_SCAN_TYPE_NORMAL) {
+		rc = cyttsp4_set_scantype(cd, cd->scan_type);
+		if (rc < 0)
+			dev_err(cd->dev, "%s: set scan type error.\n",
+					__func__);
 	}
-
-	rc = cyttsp4_get_ttconfig_info(cd);
-	if (rc < 0) {
-		dev_err(cd->dev, "%s: failed to get ttconfig info rc=%d\n",
-			__func__, rc);
-		RETRY_OR_EXIT(retry--, reset, exit);
-	}
-
-	rc = cyttsp4_get_active_refresh_cycle(cd);
-	if (rc < 0)
-		dev_err(cd->dev, "%s: failed to get refresh cycle time rc=%d\n",
-			__func__, rc);
-
-	/* attention startup */
-	call_atten_cb(cd, CY_ATTEN_STARTUP, 0);
 
 	/* restore to sleep if was suspended */
 	mutex_lock(&cd->system_lock);
 	if (cd->sleep_state == SS_SLEEP_ON) {
 		cd->sleep_state = SS_SLEEP_OFF;
 		mutex_unlock(&cd->system_lock);
-		/* watchdog is restarted by cyttsp4_core_sleep_() on error */
+
 		cyttsp4_core_sleep_(cd);
-		goto exit_no_wd;
+	} else {
+		mutex_unlock(&cd->system_lock);
+		/* attention startup */
+		spin_lock_irqsave(&cd->spinlock, flags);
+		list_for_each_entry_safe(atten, atten_n,
+			&cd->atten_list[CY_ATTEN_STARTUP], node) {
+			dev_dbg(cd->dev, "%s: attention for '%s'", __func__,
+				dev_name(&atten->ttsp->dev));
+			spin_unlock_irqrestore(&cd->spinlock, flags);
+			atten->func(atten->ttsp);
+			spin_lock_irqsave(&cd->spinlock, flags);
+		}
+		spin_unlock_irqrestore(&cd->spinlock, flags);
 	}
-	mutex_unlock(&cd->system_lock);
-
-exit:
-	cyttsp4_start_wd_timer(cd);
-
-exit_no_wd:
-	if (!detected)
-		rc = -ENODEV;
-
 	/* Required for signal to the TTHE */
 	dev_info(cd->dev, "%s: cyttsp4_exit startup r=%d...\n", __func__, rc);
 
@@ -3255,16 +2035,11 @@ static int cyttsp4_startup(struct cyttsp4_core_data *cd)
 {
 	int rc;
 
-	mutex_lock(&cd->system_lock);
-	cd->startup_state = STARTUP_RUNNING;
-	mutex_unlock(&cd->system_lock);
-
-	rc = request_exclusive(cd, cd->core,
-			CY_CORE_REQUEST_EXCLUSIVE_TIMEOUT);
+	rc = request_exclusive(cd, cd->core, CY_REQUEST_EXCLUSIVE_TIMEOUT);
 	if (rc < 0) {
 		dev_err(cd->dev, "%s: fail get exclusive ex=%p own=%p\n",
 				__func__, cd->exclusive_dev, cd->core);
-		goto exit;
+		return rc;
 	}
 
 	rc = cyttsp4_startup_(cd);
@@ -3274,14 +2049,6 @@ static int cyttsp4_startup(struct cyttsp4_core_data *cd)
 		dev_err(cd->dev, "%s: fail to release exclusive\n", __func__);
 	else
 		dev_vdbg(cd->dev, "%s: pass release exclusive\n", __func__);
-
-exit:
-	mutex_lock(&cd->system_lock);
-	cd->startup_state = STARTUP_NONE;
-	mutex_unlock(&cd->system_lock);
-
-	/* Wake the waiters for end of startup */
-	wake_up(&cd->wait_q);
 
 	return rc;
 }
@@ -3311,9 +2078,6 @@ static void cyttsp4_free_si_ptrs(struct cyttsp4_core_data *cd)
 {
 	struct cyttsp4_sysinfo *si = &cd->sysinfo;
 
-	if (!si)
-		return;
-
 	kfree(si->si_ptrs.cydata);
 	kfree(si->si_ptrs.test);
 	kfree(si->si_ptrs.pcfg);
@@ -3322,14 +2086,17 @@ static void cyttsp4_free_si_ptrs(struct cyttsp4_core_data *cd)
 	kfree(si->si_ptrs.mdata);
 	kfree(si->btn);
 	kfree(si->xy_mode);
+	kfree(si->xy_data);
 	kfree(si->btn_rec_data);
 }
 
-#if defined(CONFIG_PM_RUNTIME)
+#ifdef CONFIG_PM_RUNTIME
 static int cyttsp4_core_rt_suspend(struct device *dev)
 {
 	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
 	int rc;
+
+	dev_dbg(dev, "%s\n", __func__);
 
 	rc = cyttsp4_core_sleep(cd);
 	if (rc < 0) {
@@ -3344,6 +2111,8 @@ static int cyttsp4_core_rt_resume(struct device *dev)
 	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
 	int rc;
 
+	dev_dbg(dev, "%s\n", __func__);
+
 	rc = cyttsp4_core_wake(cd);
 	if (rc < 0) {
 		dev_err(dev, "%s: Error on wake\n", __func__);
@@ -3354,13 +2123,10 @@ static int cyttsp4_core_rt_resume(struct device *dev)
 }
 #endif
 
-#if defined(CONFIG_PM_SLEEP)
+#ifdef CONFIG_PM_SLEEP
 static int cyttsp4_core_suspend(struct device *dev)
 {
 	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
-
-	if (!(cd->pdata->flags & CY_CORE_FLAG_WAKE_ON_GESTURE))
-		return 0;
 
 	/*
 	 * This will not prevent resume
@@ -3383,9 +2149,6 @@ static int cyttsp4_core_resume(struct device *dev)
 {
 	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
 
-	if (!(cd->pdata->flags & CY_CORE_FLAG_WAKE_ON_GESTURE))
-		return 0;
-
 	enable_irq(cd->irq);
 
 	if (device_may_wakeup(dev)) {
@@ -3405,7 +2168,7 @@ static int cyttsp4_core_resume(struct device *dev)
 static const struct dev_pm_ops cyttsp4_core_pm_ops = {
 	SET_SYSTEM_SLEEP_PM_OPS(cyttsp4_core_suspend, cyttsp4_core_resume)
 	SET_RUNTIME_PM_OPS(cyttsp4_core_rt_suspend, cyttsp4_core_rt_resume,
-			NULL)
+				NULL)
 };
 
 /*
@@ -3415,30 +2178,16 @@ static ssize_t cyttsp4_ic_ver_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
-	struct cyttsp4_cydata *cydata;
+	struct cyttsp4_cydata *cydata = cd->sysinfo.si_ptrs.cydata;
 
-	mutex_lock(&cd->system_lock);
-	if (!cd->sysinfo.ready) {
-		if (cd->invalid_touch_app) {
-			mutex_unlock(&cd->system_lock);
-			return snprintf(buf, CY_MAX_PRBUF_SIZE,
-					"Corrupted Touch application!\n");
-		} else {
-			mutex_unlock(&cd->system_lock);
-			return snprintf(buf, CY_MAX_PRBUF_SIZE,
-					"System Information not ready!\n");
-		}
-	}
-	mutex_unlock(&cd->system_lock);
-
-	cydata = cd->sysinfo.si_ptrs.cydata;
+	if (cydata == NULL)
+		return -ENODEV;
 
 	return snprintf(buf, CY_MAX_PRBUF_SIZE,
 		"%s: 0x%02X 0x%02X\n"
 		"%s: 0x%02X\n"
 		"%s: 0x%02X\n"
 		"%s: 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n"
-		"%s: 0x%04X\n"
 		"%s: 0x%02X\n"
 		"%s: 0x%02X\n",
 		"TrueTouch Product ID", cydata->ttpidh, cydata->ttpidl,
@@ -3448,21 +2197,8 @@ static ssize_t cyttsp4_ic_ver_show(struct device *dev,
 		cydata->revctrl[1], cydata->revctrl[2], cydata->revctrl[3],
 		cydata->revctrl[4], cydata->revctrl[5], cydata->revctrl[6],
 		cydata->revctrl[7],
-		"TrueTouch Config Version", cd->sysinfo.ttconfig.version,
 		"Bootloader Major Version", cydata->blver_major,
 		"Bootloader Minor Version", cydata->blver_minor);
-}
-
-/*
- * Show TT Config version via sysfs
- */
-static ssize_t cyttsp4_ttconfig_ver_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
-
-	return snprintf(buf, CY_MAX_PRBUF_SIZE, "0x%04X\n",
-			cd->sysinfo.ttconfig.version);
 }
 
 /*
@@ -3475,6 +2211,23 @@ static ssize_t cyttsp4_drv_ver_show(struct device *dev,
 		"Driver: %s\nVersion: %s\nDate: %s\n",
 		cy_driver_core_name, cy_driver_core_version,
 		cy_driver_core_date);
+}
+
+static ssize_t cyttsp4_fw_info_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
+	struct cyttsp4_pcfg *pcfg = cd->sysinfo.si_ptrs.pcfg;
+
+	if (pcfg == NULL)
+		return -ENODEV;
+
+	return scnprintf(buf, CY_MAX_PRBUF_SIZE,
+		"Project: %d, Version: 0x%02x, Config: %d, Panel: %d.\n",
+		GET_FW_PROJ(pcfg->config_ver),
+		GET_FW_VER(pcfg->config_ver),
+		GET_FW_CONF(pcfg->config_ver),
+		GET_FW_PANEL(pcfg->panel_info));
 }
 
 /*
@@ -3492,43 +2245,6 @@ static ssize_t cyttsp4_hw_reset_store(struct device *dev,
 			__func__, rc);
 
 	return size;
-}
-
-static ssize_t	cyttsp4_set_mode_store( struct device *dev, struct device_attribute *attr, const char *buf, size_t size )
-{
-	struct cyttsp4_core_data	*cd = dev_get_drvdata( dev );
-	int rc = 0, mode = *buf ^ 0x30;
-
-	rc	= set_mode( cd, 4 << mode );
-	if( rc < 0 )
-		printk( "CTUCH : Failed to change mode!!!\n" );
-
-	return size;
-}
-
-static ssize_t	cyttsp4_bootloader_mode_show( struct device *dev, struct device_attribute *attr, char *buf )
-{
-
-	struct cyttsp4_core_data	*cd = dev_get_drvdata( dev );
-	u8 mode[2];
-
-	*buf	= 0;
-
-	if( !cd )
-		printk( "CTUCH : NULL pointer of driver data!!!\n" );
-	else
-	{
-		mutex_lock( &cd->system_lock );
-
-		if( cyttsp4_adap_read( cd, CY_REG_BASE, &mode, sizeof( mode ) ) )
-			printk( "CTUCH : Failed to read status of bootloader mode!!!\n" );
-		else
-			*buf	= IS_BOOTLOADER( mode[ 0 ], mode[ 1 ] ) ? 1 : 0;
-
-		mutex_unlock(&cd->system_lock);
-	}
-
-	return 1;
 }
 
 /*
@@ -3588,7 +2304,7 @@ static ssize_t cyttsp4_drv_irq_store(struct device *dev,
 {
 	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
 	unsigned long value;
-	int retval;
+	int retval = 0;
 
 	retval = kstrtoul(buf, 10, &value);
 	if (retval < 0) {
@@ -3678,10 +2394,14 @@ static ssize_t cyttsp4_drv_debug_store(struct device *dev,
 		break;
 	default:
 		dev_err(dev, "%s: Invalid value\n", __func__);
+		rc = -EINVAL;
+		break;
 	}
 
+	if (rc == 0)
+		rc = size;
 cyttsp4_drv_debug_store_exit:
-	return size;
+	return rc;
 }
 
 /*
@@ -3705,247 +2425,324 @@ static ssize_t cyttsp4_sleep_status_show(struct device *dev,
 	return ret;
 }
 
-static ssize_t cyttsp4_easy_wakeup_gesture_show(struct device *dev,
+
+static ssize_t cyttsp4_signal_disparity_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
 	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
-	ssize_t ret;
+	u8 cmd_buf[CY_CMD_OP_GET_PARA_CMD_SZ];
+	u8 return_buf[CY_CMD_OP_GET_PARA_RET_SZ];
+	int rc;
 
-	mutex_lock(&cd->system_lock);
-	ret = snprintf(buf, CY_MAX_PRBUF_SIZE, "0x%02X\n",
-			cd->easy_wakeup_gesture);
-	mutex_unlock(&cd->system_lock);
-	return ret;
+	cmd_buf[0] = CY_CMD_OP_GET_PARA;
+	cmd_buf[1] = CY_OP_PARA_SCAN_TYPE;
+
+	pm_runtime_get_sync(dev);
+	rc = request_exec_cmd(cd, CY_MODE_OPERATIONAL,
+			cmd_buf, sizeof(cmd_buf),
+			return_buf, sizeof(return_buf),
+			CY_CORE_COMMAND_COMPLETE_TIMEOUT);
+	pm_runtime_put(dev);
+
+	if (rc < 0) {
+		dev_err(dev, "%s: exec cmd error.\n", __func__);
+		goto show_exit;
+	}
+
+	dev_dbg(dev, "%s: return_buf=0x%x,0x%x,0x%x\n", __func__,
+			return_buf[0],	return_buf[1],	return_buf[2]);
+
+	if (return_buf[0] != CY_OP_PARA_SCAN_TYPE) {
+		dev_err(dev, "%s: return data error.\n", __func__);
+		rc = -EINVAL;
+		goto show_exit;
+	}
+
+	rc = return_buf[2];
+
+show_exit:
+	return scnprintf(buf, CY_MAX_PRBUF_SIZE, "%d\n", rc);
 }
 
-static ssize_t cyttsp4_easy_wakeup_gesture_store(struct device *dev,
+static ssize_t cyttsp4_signal_disparity_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t size)
 {
 	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
-	unsigned long value;
-	int ret;
+	unsigned long disparity_val;
+	u8 scan_type;
+	int rc;
 
-	ret = kstrtoul(buf, 10, &value);
-	if (ret < 0)
-		return ret;
+	rc = kstrtoul(buf, 10, &disparity_val);
+	if (rc < 0) {
+		dev_err(dev, "%s: Invalid value.\n", __func__);
+		goto store_exit;
+	}
 
-	if (value > 0xFF)
-	{
-		ret = -EINVAL;
-		return ret;
+	dev_dbg(dev, "%s: set signal disparity=%d\n", __func__,
+			(int)disparity_val);
+
+	switch (disparity_val) {
+	case CY_SIGNAL_DISPARITY_NONE:
+		scan_type = CY_OP_PARA_SCAN_TYPE_NORMAL;
+		break;
+	case CY_SIGNAL_DISPARITY_SENSITIVITY:
+		scan_type = CY_OP_PARA_SCAN_TYPE_APAMC_MASK |
+				CY_OP_PARA_SCAN_TYPE_GLOVE_MASK;
+		break;
+	default:
+		dev_err(dev, "%s: Invalid signal disparity=%d\n", __func__,
+				(int)disparity_val);
+		rc = -EINVAL;
+		goto store_exit;
 	}
 
 	pm_runtime_get_sync(dev);
-
-	mutex_lock(&cd->system_lock);
-	if (cd->sysinfo.ready && IS_TTSP_VER_GE(&cd->sysinfo, 2, 5))
-		cd->easy_wakeup_gesture = (u8)value;
-	else
-		ret = -ENODEV;
-	mutex_unlock(&cd->system_lock);
-
+	rc = cyttsp4_set_scantype(cd, scan_type);
 	pm_runtime_put(dev);
 
-	if (ret)
-		return ret;
-
-	return size;
-}
-
-/* Show Panel ID via sysfs */
-static ssize_t	cyttsp4_panel_id_show( struct device *dev, struct device_attribute *attr, char *buf )
-{
-
-	struct cyttsp4_core_data	*cd = dev_get_drvdata( dev );
-
-	if( !cd || !cd->sysinfo.si_ptrs.pcfg )
-	{
-		printk( "CTUCH : NULL pointer of driver data!\n" );
-		return	0;
+	if (rc < 0) {
+		dev_err(dev, "%s: exec cmd error.\n", __func__);
+		goto store_exit;
 	}
 
-	*buf	= cd->sysinfo.si_ptrs.pcfg->panel_info0 & 0x7;
+	cd->scan_type = scan_type;
+	rc = size;
 
-	printk( "CTUCH : Panel ID(%x)\n", *buf );
-	return 1;
+store_exit:
+	return rc;
 }
 
-// Enable/disable glove mode
-static ssize_t cyttsp4_signal_disparity_show(struct device *dev,
-                   struct device_attribute *attr, char *buf)
+/*
+ * Show finger threshold value via sysfs
+ */
+static ssize_t cyttsp4_finger_threshold_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
 {
-         struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
-         u8 cmd_buf[CY_CMD_OP_GET_PARA_CMD_SZ];
-         u8 return_buf[CY_CMD_OP_GET_PARA_RET_SZ];
-         int rc;
- 
-         cmd_buf[0] = CY_CMD_OP_GET_PARAM;
-         cmd_buf[1] = CY_OP_PARA_SCAN_TYPE;
- 
-         pm_runtime_get_sync(dev);
- 
-         rc = request_exclusive(cd, cd->core, CY_CORE_REQUEST_EXCLUSIVE_TIMEOUT);
-         if (rc < 0) {
-                   dev_err(cd->dev, "%s: fail get exclusive ex=%p own=%p\n",
-                                     __func__, cd->exclusive_dev, cd->core);
-                   goto exit_put;
-         }
- 
-         rc = cyttsp4_exec_cmd(cd, CY_MODE_OPERATIONAL,
-                            cmd_buf, sizeof(cmd_buf),
-                            return_buf, sizeof(return_buf),
-                            CY_COMMAND_COMPLETE_TIMEOUT);
-         if (rc < 0) {
-                   dev_err(dev, "%s: exec cmd error.\n", __func__);
-                   goto exit_release;
-         }
- 
-         dev_dbg(dev, "%s: return_buf=0x%x,0x%x,0x%x\n", __func__,
-                            return_buf[0], return_buf[1], return_buf[2]);
- 
-         if (return_buf[0] != CY_OP_PARA_SCAN_TYPE) {
-                   dev_err(dev, "%s: return data error.\n", __func__);
-                   rc = -EINVAL;
-                   goto exit_release;
-         }
- 
-         rc = return_buf[2];
- 
-exit_release:
-         if (release_exclusive(cd, cd->core) < 0)
-                   dev_err(cd->dev, "%s: fail to release exclusive\n", __func__);
-exit_put:
-         pm_runtime_put(dev);
-         return scnprintf(buf, CY_MAX_PRBUF_SIZE, "%d\n", rc);
+	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
+	u8 cmd_buf[CY_CMD_OP_GET_PARA_CMD_SZ];
+	u8 return_buf[CY_CMD_OP_GET_PARA_RET_SZ];
+	u8 finger_threshold_h, finger_threshold_l;
+	int rc;
+
+	cmd_buf[0] = CY_CMD_OP_GET_PARA;
+	cmd_buf[1] = CY_OP_PARA_FINGER_THRESHOLD;
+
+	pm_runtime_get_sync(dev);
+	rc = request_exec_cmd(cd, CY_MODE_OPERATIONAL,
+			cmd_buf, sizeof(cmd_buf),
+			return_buf, sizeof(return_buf),
+			CY_CORE_COMMAND_COMPLETE_TIMEOUT);
+	pm_runtime_put(dev);
+
+	if (rc < 0) {
+		dev_err(dev, "%s: exec cmd error.\n", __func__);
+		goto show_exit;
+	}
+
+	dev_dbg(dev, "%s: return_buf=0x%x,0x%x,0x%x,0x%x\n", __func__,
+			return_buf[0],	return_buf[1],	return_buf[2],
+			return_buf[3]);
+
+	if (return_buf[0] != CY_OP_PARA_FINGER_THRESHOLD) {
+		dev_err(dev, "%s: return data error.\n", __func__);
+		rc = -EINVAL;
+		goto show_exit;
+	}
+
+	finger_threshold_h = return_buf[2];
+	finger_threshold_l = return_buf[3];
+	rc = merge_bytes(finger_threshold_h, finger_threshold_l);
+
+show_exit:
+	return scnprintf(buf, CY_MAX_PRBUF_SIZE, "%d\n", rc);
 }
- 
-bool	glove_mode = false;
 
-EXPORT_SYMBOL( glove_mode );
-
-struct device	*store_device = 0;
-
-static ssize_t cyttsp4_signal_disparity_store(struct device *dev,
-                   struct device_attribute *attr, const char *buf, size_t size)
+/*
+ * change finger threshold via sysfs
+ */
+static ssize_t cyttsp4_finger_threshold_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
 {
-         struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
-         unsigned long disparity_val;
-         u8 cmd_buf[CY_CMD_OP_SET_PARA_CMD_SZ];
-         u8 return_buf[CY_CMD_OP_SET_PARA_RET_SZ];
-         u8 scan_type;
-	 bool	set_glove;
-         int rc;
+	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
+	unsigned long threshold_val;
+	u8 cmd_buf[CY_CMD_OP_SET_PARA_CMD_SZ];
+	u8 return_buf[CY_CMD_OP_SET_PARA_RET_SZ];
+	int rc;
 
-	 store_device	= dev;
- 
-         rc = kstrtoul(buf, 10, &disparity_val);
-         if (rc < 0) {
-                   dev_err(dev, "%s: Invalid value.\n", __func__);
-                   goto exit;
-         }
+	rc = kstrtoul(buf, 10, &threshold_val);
+	if (rc < 0) {
+		dev_err(dev, "%s: Invalid value.\n", __func__);
+		goto store_exit;
+	}
 
-         mutex_lock(&cd->system_lock);
+	if ((threshold_val < CY_OP_PARA_FINGER_THRESHOLD_MIN_VAL) ||
+		(threshold_val > CY_OP_PARA_FINGER_THRESHOLD_MAX_VAL)) {
+		dev_err(dev, "%s: Invalid value, value=%d.\n", __func__,
+				(int)threshold_val);
+		rc = -EINVAL;
+		goto store_exit;
+	}
 
-	 set_glove	= false;
+	cmd_buf[0] = CY_CMD_OP_SET_PARA;
+	cmd_buf[1] = CY_OP_PARA_FINGER_THRESHOLD;
+	cmd_buf[2] = CY_OP_PARA_FINGER_THRESHOLD_SZ;
+	cmd_buf[3] = (u8)((threshold_val >> 8) & 0xFF);
+	cmd_buf[4] = (u8)(threshold_val & 0xFF);
 
-         switch (disparity_val) {
-         case CY_SIGNAL_DISPARITY_NONE:
-                   cd->opmode = OPMODE_FINGER;
-                   scan_type = 0x1;
-                   break;
-         case CY_SIGNAL_DISPARITY_SENSITIVITY:
-                   cd->opmode = OPMODE_GLOVE;
-                   scan_type = 0x3;
+	pm_runtime_get_sync(dev);
+	rc = request_exec_cmd(cd, CY_MODE_OPERATIONAL,
+			cmd_buf, sizeof(cmd_buf),
+			return_buf, sizeof(return_buf),
+			CY_CORE_COMMAND_COMPLETE_TIMEOUT);
+	pm_runtime_put(dev);
 
-		   set_glove	= true;
+	if (rc < 0) {
+		dev_err(dev, "%s: exec cmd error.\n", __func__);
+		goto store_exit;
+	}
 
-                   break;
-         default:
-                   mutex_unlock(&cd->system_lock);
-                   dev_err(dev, "%s: Invalid signal disparity=%d\n", __func__,
-                                     (int)disparity_val);
-                   rc = -EINVAL;
-                   goto exit;
-         }
-         mutex_unlock(&cd->system_lock);
- 
-         cmd_buf[0] = CY_CMD_OP_SET_PARAM;
-         cmd_buf[1] = CY_OP_PARA_SCAN_TYPE;
-         cmd_buf[2] = CY_OP_PARA_SCAN_TYPE_SZ;
-         cmd_buf[3] = scan_type;
- 
-         pm_runtime_get_sync(dev);
- 
-         rc = request_exclusive(cd, cd->core, CY_CORE_REQUEST_EXCLUSIVE_TIMEOUT);
-         if (rc < 0) {
-                   dev_err(cd->dev, "%s: fail get exclusive ex=%p own=%p\n",
-                                     __func__, cd->exclusive_dev, cd->core);
-                   goto exit_put;
-         }
- 
-         rc = cyttsp4_exec_cmd(cd, CY_MODE_OPERATIONAL,
-                            cmd_buf, sizeof(cmd_buf),
-                            return_buf, sizeof(return_buf),
-                            CY_COMMAND_COMPLETE_TIMEOUT);
-         if (rc < 0) {
-                   dev_err(dev, "%s: exec cmd error.\n", __func__);
-                   goto exit_release;
-         }
+	rc = size;
+	dev_dbg(dev, "%s: return_buf=0x%x,0x%x\n", __func__,
+			return_buf[0],	return_buf[1]);
 
-	 glove_mode	= set_glove;
-
-	 printk( "CTUCH : Glove mode(%s)\n", glove_mode ? "true" : "false" );
- 
-         rc = size;
-         dev_dbg(dev, "%s: return_buf=0x%x,0x%x\n", __func__,
-                            return_buf[0], return_buf[1]);
-exit_release:
-         if (release_exclusive(cd, cd->core) < 0)
-                   /* Don't return fail code, mode is already changed. */
-                   dev_err(cd->dev, "%s: fail to release exclusive\n", __func__);
-         else
-                   dev_vdbg(cd->dev, "%s: pass release exclusive\n", __func__);
-exit_put:
-         pm_runtime_put(dev);
-exit:
-         return rc;
+store_exit:
+	return rc;
 }
 
-void	RestoreGloveState( void )
+
+static ssize_t cyttsp4_calibration_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
 {
-	if( !store_device )
-		return;
+	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
+	char mutul_buf[CY_CMD_CAT_MUTUAL_CAP_IDAC_DATA_NUM];
+	char self_buf[CY_CMD_CAT_SELF_CAP_IDAC_DATA_NUM];
+	int index, i;
+	int rc;
 
-	cyttsp4_signal_disparity_store( store_device, 0, glove_mode ? "1\n" : "0\n", 1 );
-	printk( "CTUCH : Glove mode(%s)\n", glove_mode ? "enable" : "disable" );
+	rc = request_exclusive(cd, cd->core, CY_REQUEST_EXCLUSIVE_TIMEOUT);
+	if (rc < 0) {
+		dev_err(dev, "%s: fail get exclusive ex=%p own=%p\n",
+				__func__, cd->exclusive_dev, cd->core);
+		goto cyttsp4_get_idac_err_exit;
+	}
+
+	rc = set_mode(cd, cd->core, CY_HST_CAT, CY_MODE_CAT);
+	if (rc < 0) {
+		dev_err(dev, "%s: fail set mode rc=%d.\n", __func__, rc);
+		goto cyttsp4_get_idac_err_exclusive;
+	}
+
+	/* Retrive IDAC data with Mutual Capacitance Fine mode */
+	rc = cyttsp4_get_idac_data(cd,
+			CY_CMD_CAT_MUTUAL_CAP_IDAC_DATA_NUM,
+			CY_CMD_CAT_RET_MUTUAL_CAP_IDAC_DATA, mutul_buf);
+
+	if (rc < 0) {
+		dev_err(dev, "%s: Fail to retrive mutual-cap idac data.\n",
+				__func__);
+		goto cyttsp4_get_idac_err_change_mode;
+	}
+
+	/* Retrive IDAC data with Self Capacitance mode */
+	rc = cyttsp4_get_idac_data(cd,
+			CY_CMD_CAT_SELF_CAP_IDAC_DATA_NUM,
+			CY_CMD_CAT_RET_SELF_CAP_IDAC_DATA, self_buf);
+
+	if (rc < 0) {
+		dev_err(dev, "%s: Fail to retrive self-cap idac data.\n",
+				__func__);
+	}
+
+cyttsp4_get_idac_err_change_mode:
+	if (set_mode(cd, cd->core, CY_HST_OPERATE, CY_MODE_OPERATIONAL) < 0)
+		dev_err(dev, "%s: fail to set op mode.\n", __func__);
+cyttsp4_get_idac_err_exclusive:
+	if (release_exclusive(cd, cd->core) < 0)
+		/* Don't return fail code, mode is already changed. */
+		dev_err(dev, "%s: fail to release exclusive\n", __func__);
+	else
+		dev_vdbg(cd->dev, "%s: pass release exclusive\n", __func__);
+
+	if (rc == 0) {
+		index = scnprintf(buf, CY_MAX_PRBUF_SIZE,
+					"mutual-cap idac data:\n");
+		for (i = 0; i < CY_CMD_CAT_MUTUAL_CAP_IDAC_DATA_NUM; i++) {
+			index += scnprintf(buf+index, CY_MAX_PRBUF_SIZE-index,
+						"%d ", mutul_buf[i]);
+		}
+
+		index += scnprintf(buf+index, CY_MAX_PRBUF_SIZE-index,
+					"\nself-cap idac data:\n");
+		for (i = 0; i < CY_CMD_CAT_SELF_CAP_IDAC_DATA_NUM; i++) {
+			index += scnprintf(buf+index, CY_MAX_PRBUF_SIZE-index,
+						"%d ", self_buf[i]);
+		}
+		rc = index;
+	}
+cyttsp4_get_idac_err_exit:
+	return rc;
 }
-EXPORT_SYMBOL( RestoreGloveState );
+
+static ssize_t cyttsp4_calibration_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct cyttsp4_core_data *cd = dev_get_drvdata(dev);
+	int rc;
+
+	rc = request_exclusive(cd, cd->core, CY_REQUEST_EXCLUSIVE_TIMEOUT);
+	if (rc < 0) {
+		dev_err(dev, "%s: fail get exclusive ex=%p own=%p\n",
+				__func__, cd->exclusive_dev, cd->core);
+		goto cyttsp4_calibration_error_exit;
+	}
+
+	rc = set_mode(cd, cd->core, CY_HST_CAT, CY_MODE_CAT);
+	if (rc < 0) {
+		dev_err(dev, "%s: fail set mode rc=%d.\n", __func__, rc);
+		goto cyttsp4_calibration_error_exclusive;
+	}
+
+	rc = cyttsp4_calibrate_idac(cd);
+	if (rc < 0)
+		dev_err(dev, "%s: fail do calibration rc=%d\n", __func__, rc);
+	else
+		rc = size;
+
+	if (set_mode(cd, cd->core, CY_HST_OPERATE, CY_MODE_OPERATIONAL) < 0)
+		dev_err(dev, "%s: fail set op mode.\n", __func__);
+
+cyttsp4_calibration_error_exclusive:
+	if (release_exclusive(cd, cd->core) < 0)
+		/* Don't return fail code, mode is already changed. */
+		dev_err(dev, "%s: fail to release exclusive\n", __func__);
+	else
+		dev_vdbg(dev, "%s: pass release exclusive\n", __func__);
+
+cyttsp4_calibration_error_exit:
+	return rc;
+}
 
 static struct device_attribute attributes[] = {
 	__ATTR(ic_ver, S_IRUGO, cyttsp4_ic_ver_show, NULL),
-	__ATTR(ttconfig_ver, S_IRUGO, cyttsp4_ttconfig_ver_show, NULL),
 	__ATTR(drv_ver, S_IRUGO, cyttsp4_drv_ver_show, NULL),
-	__ATTR(hw_reset, S_IWUSR | S_IWGRP, NULL, cyttsp4_hw_reset_store),
-	__ATTR(hw_irq_stat, S_IRUGO, cyttsp4_hw_irq_stat_show, NULL),
-	__ATTR(drv_irq, S_IRUGO | S_IWUSR | S_IWGRP, cyttsp4_drv_irq_show, cyttsp4_drv_irq_store),
-	__ATTR(drv_debug, S_IWUSR | S_IWGRP, NULL, cyttsp4_drv_debug_store),
-	__ATTR(sleep_status, S_IRUGO, cyttsp4_sleep_status_show, NULL),
-	__ATTR(easy_wakeup_gesture, S_IRUGO | S_IWUSR | S_IWGRP, cyttsp4_easy_wakeup_gesture_show, cyttsp4_easy_wakeup_gesture_store),
-	__ATTR( set_mode, S_IWUSR | S_IWGRP, NULL, cyttsp4_set_mode_store),
-	__ATTR( get_bootloader_state, S_IRUGO, cyttsp4_bootloader_mode_show, NULL ),
-	__ATTR( glove, S_IRUGO | S_IWUSR | S_IWGRP, cyttsp4_signal_disparity_show, cyttsp4_signal_disparity_store ),
-	__ATTR( panel_id, S_IRUGO, cyttsp4_panel_id_show, NULL ),
+	__ATTR(fw_info, S_IRUGO, cyttsp4_fw_info_show, NULL),
+	__ATTR(hw_reset, S_IWUSR, NULL, cyttsp4_hw_reset_store),
+	__ATTR(hw_irq_stat, S_IRUSR, cyttsp4_hw_irq_stat_show, NULL),
+	__ATTR(drv_irq, S_IRUSR | S_IWUSR, cyttsp4_drv_irq_show,
+		cyttsp4_drv_irq_store),
+	__ATTR(drv_debug, S_IWUSR, NULL, cyttsp4_drv_debug_store),
+	__ATTR(sleep_status, S_IRUSR, cyttsp4_sleep_status_show, NULL),
+	__ATTR(calibration, S_IRUSR | S_IWUSR, cyttsp4_calibration_show,
+		cyttsp4_calibration_store),
 };
 
-static int add_sysfs_interfaces(struct cyttsp4_core_data *cd,
-		struct device *dev)
+static int add_sysfs_interfaces(struct device *dev)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(attributes); i++)
 		if (device_create_file(dev, attributes + i))
 			goto undo;
-
 	return 0;
 undo:
 	for (i--; i >= 0 ; i--)
@@ -3954,13 +2751,40 @@ undo:
 	return -ENODEV;
 }
 
-static void remove_sysfs_interfaces(struct cyttsp4_core_data *cd,
-		struct device *dev)
+static void remove_sysfs_interfaces(struct device *dev)
+{
+	int i;
+	for (i = 0; i < ARRAY_SIZE(attributes); i++)
+		device_remove_file(dev, attributes + i);
+}
+
+static struct device_attribute sensitivity_attributes[] = {
+	__ATTR(signal_disparity, S_IRUGO | S_IWUSR,
+		cyttsp4_signal_disparity_show, cyttsp4_signal_disparity_store),
+	__ATTR(finger_threshold, S_IRUGO | S_IWUSR,
+		cyttsp4_finger_threshold_show, cyttsp4_finger_threshold_store),
+};
+
+static int add_sensitivity_sysfs_interfaces(struct device *dev)
 {
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(attributes); i++)
-		device_remove_file(dev, attributes + i);
+	for (i = 0; i < ARRAY_SIZE(sensitivity_attributes); i++)
+		if (device_create_file(dev, sensitivity_attributes + i))
+			goto undo;
+	return 0;
+undo:
+	for (i--; i >= 0 ; i--)
+		device_remove_file(dev, sensitivity_attributes + i);
+	dev_err(dev, "%s: failed to create sysfs interface\n", __func__);
+	return -ENODEV;
+}
+
+static void remove_sensitivity_sysfs_interfaces(struct device *dev)
+{
+	int i;
+	for (i = 0; i < ARRAY_SIZE(sensitivity_attributes); i++)
+		device_remove_file(dev, sensitivity_attributes + i);
 }
 
 static int cyttsp4_core_probe(struct cyttsp4_core *core)
@@ -3977,9 +2801,9 @@ static int cyttsp4_core_probe(struct cyttsp4_core *core)
 	dev_vdbg(dev, "%s: verbose debug on\n", __func__);
 
 	if (pdata == NULL) {
-		dev_err(dev, "%s: Missing platform data\n", __func__);
-		rc = -ENODEV;
-		goto error_no_pdata;
+		dev_err(dev, "%s: Error, platform data is NULL.\n", __func__);
+		rc = -EINVAL;
+		goto error_alloc_data_failed;
 	}
 
 	/* get context and debug print buffers */
@@ -3987,53 +2811,37 @@ static int cyttsp4_core_probe(struct cyttsp4_core *core)
 	if (cd == NULL) {
 		dev_err(dev, "%s: Error, kzalloc\n", __func__);
 		rc = -ENOMEM;
-		goto error_alloc_data;
+		goto error_alloc_data_failed;
 	}
 
-	/* Initialize device info */
+	/* point to core device and init lists */
+	cd->is_probe = true;
 	cd->core = core;
-	cd->dev = dev;
-	cd->pdata = pdata;
-	cd->max_xfer = CY_DEFAULT_ADAP_MAX_XFER;
-	if (pdata->max_xfer_len) {
-		if (pdata->max_xfer_len < CY_ADAP_MIN_XFER) {
-			dev_err(dev, "%s: max_xfer_len invalid (min=%d)\n",
-				__func__, CY_ADAP_MIN_XFER);
-			rc = -EINVAL;
-			goto error_max_xfer;
-		}
-		cd->max_xfer = pdata->max_xfer_len;
-		dev_dbg(dev, "%s: max_xfer set to %d\n",
-			__func__, cd->max_xfer);
-	}
-
-	/* Initialize mutexes and spinlocks */
 	mutex_init(&cd->system_lock);
 	mutex_init(&cd->adap_lock);
-	spin_lock_init(&cd->spinlock);
-
-	/* Initialize attention lists */
 	for (type = 0; type < CY_ATTEN_NUM_ATTEN; type++)
 		INIT_LIST_HEAD(&cd->atten_list[type]);
-
-	/* Initialize wait queue */
 	init_waitqueue_head(&cd->wait_q);
+	init_waitqueue_head(&cd->sleep_q);
+	cd->startup_work_q = create_singlethread_workqueue("startup_work_q");
+	if (cd->startup_work_q == NULL) {
+		dev_err(dev, "%s: No memory for %s\n", __func__,
+			"startup_work_q");
+		goto error_init;
+	}
 
-	/* Initialize works */
-	INIT_WORK(&cd->startup_work, cyttsp4_startup_work_function);
-	INIT_WORK(&cd->watchdog_work, cyttsp4_watchdog_work);
-
-	/* Initialize IRQ */
+	dev_dbg(dev, "%s: initialize core data\n", __func__);
+	spin_lock_init(&cd->spinlock);
+	cd->dev = dev;
+	cd->pdata = pdata;
 	cd->irq = gpio_to_irq(pdata->irq_gpio);
+	cd->irq_enabled = true;
+	dev_set_drvdata(dev, cd);
 	if (cd->irq < 0) {
 		rc = -EINVAL;
 		goto error_gpio_irq;
 	}
-	cd->irq_enabled = true;
 
-	dev_set_drvdata(dev, cd);
-
-	/* Call platform init function */
 	if (cd->pdata->init) {
 		dev_info(cd->dev, "%s: Init HW\n", __func__);
 		rc = cd->pdata->init(cd->pdata, 1, cd->dev);
@@ -4041,20 +2849,12 @@ static int cyttsp4_core_probe(struct cyttsp4_core *core)
 		dev_info(cd->dev, "%s: No HW INIT function\n", __func__);
 		rc = 0;
 	}
-	if (rc < 0)
+	if (rc < 0) {
 		dev_err(cd->dev, "%s: HW Init fail r=%d\n", __func__, rc);
-
-	/* Call platform detect function */
-	if (cd->pdata->detect) {
-		dev_info(cd->dev, "%s: Detect HW\n", __func__);
-		rc = cd->pdata->detect(cd->pdata, cd->dev,
-				cyttsp4_platform_detect_read);
-		if (rc) {
-			dev_info(cd->dev, "%s: No HW detected\n", __func__);
-			rc = -ENODEV;
-			goto error_detect;
-		}
+		goto error_gpio_irq;
 	}
+
+	INIT_WORK(&cd->startup_work, cyttsp4_startup_work_function);
 
 	dev_dbg(dev, "%s: initialize threaded irq=%d\n", __func__, cd->irq);
 	if (cd->pdata->level_irq_udelay > 0)
@@ -4064,17 +2864,31 @@ static int cyttsp4_core_probe(struct cyttsp4_core *core)
 		/* use edge triggered interrupts */
 		irq_flags = IRQF_TRIGGER_FALLING | IRQF_ONESHOT;
 
-	rc = request_threaded_irq(cd->irq, cyttsp4_hard_irq, cyttsp4_irq,
-			irq_flags, dev_name(dev), cd);
+	rc = request_threaded_irq(cd->irq, NULL, cyttsp4_irq, irq_flags,
+		dev_name(dev), cd);
 	if (rc < 0) {
 		dev_err(dev, "%s: Error, could not request irq\n", __func__);
 		goto error_request_irq;
 	}
 
-	/* Setup watchdog timer */
-	setup_timer(&cd->watchdog_timer, cyttsp4_watchdog_timer,
-		(unsigned long)cd);
+	INIT_WORK(&cd->work, cyttsp4_timer_watchdog);
+	setup_timer(&cd->timer, cyttsp4_timer, (unsigned long)cd);
 
+	dev_dbg(dev, "%s: add sysfs interfaces\n", __func__);
+	rc = add_sysfs_interfaces(dev);
+	if (rc < 0) {
+		dev_err(dev, "%s: Error, fail sysfs init\n", __func__);
+		goto error_attr_create;
+	}
+
+	if (cd->pdata->use_configure_sensitivity) {
+		rc = add_sensitivity_sysfs_interfaces(dev);
+		if (rc < 0) {
+			dev_err(dev, "%s: Error, fail sensitivity sysfs init\n",
+				__func__);
+			goto error_sens_attr_create;
+		}
+	}
 	pm_runtime_enable(dev);
 
 	/*
@@ -4087,47 +2901,36 @@ static int cyttsp4_core_probe(struct cyttsp4_core *core)
 	rc = cyttsp4_startup(cd);
 	pm_runtime_put(dev);
 
-	/* Do not fail probe if startup fails but the device is detected */
-	if (rc == -ENODEV) {
+	if (rc < 0) {
 		dev_err(cd->dev, "%s: Fail initial startup r=%d\n",
 			__func__, rc);
 		goto error_startup;
 	}
 
-	if (IS_TTSP_VER_GE(&cd->sysinfo, 2, 5))
-		cd->easy_wakeup_gesture = pdata->easy_wakeup_gesture;
-	else
-		cd->easy_wakeup_gesture = 0xFF;
-
-	dev_dbg(dev, "%s: add sysfs interfaces\n", __func__);
-	rc = add_sysfs_interfaces(cd, dev);
-	if (rc < 0) {
-		dev_err(dev, "%s: Error, fail sysfs init\n", __func__);
-		goto error_startup;
-	}
-
-	device_init_wakeup(dev, 1);
-
-	dev_dbg(dev, "%s: ok\n", __func__);
-	return 0;
+	dev_info(dev, "%s: ok\n", __func__);
+	cd->is_probe = false;
+	rc = 0;
+	goto no_error;
 
 error_startup:
-	cancel_work_sync(&cd->startup_work);
-	cyttsp4_stop_wd_timer(cd);
 	pm_runtime_disable(dev);
 	cyttsp4_free_si_ptrs(cd);
+	if (cd->pdata->use_configure_sensitivity)
+		remove_sensitivity_sysfs_interfaces(dev);
+error_sens_attr_create:
+	remove_sysfs_interfaces(dev);
+error_attr_create:
 	free_irq(cd->irq, cd);
 error_request_irq:
-error_detect:
 	if (pdata->init)
 		pdata->init(pdata, 0, dev);
-	dev_set_drvdata(dev, NULL);
 error_gpio_irq:
-error_max_xfer:
+error_init:
+	dev_set_drvdata(dev, NULL);
 	kfree(cd);
-error_alloc_data:
-error_no_pdata:
+error_alloc_data_failed:
 	dev_err(dev, "%s failed.\n", __func__);
+no_error:
 	return rc;
 }
 
@@ -4138,18 +2941,14 @@ static int cyttsp4_core_release(struct cyttsp4_core *core)
 
 	dev_dbg(dev, "%s\n", __func__);
 
-	/*
-	 * Suspend the device before freeing the startup_work and stopping
-	 * the watchdog since sleep function restarts watchdog on failure
-	 */
+	cyttsp4_stop_wd_timer(cd);
+
 	pm_runtime_suspend(dev);
 	pm_runtime_disable(dev);
 
-	cancel_work_sync(&cd->startup_work);
-
-	cyttsp4_stop_wd_timer(cd);
-
-	remove_sysfs_interfaces(cd, dev);
+	remove_sysfs_interfaces(dev);
+	if (cd->pdata->use_configure_sensitivity)
+		remove_sensitivity_sysfs_interfaces(dev);
 	free_irq(cd->irq, cd);
 	if (cd->pdata->init)
 		cd->pdata->init(cd->pdata, 0, dev);
@@ -4159,7 +2958,7 @@ static int cyttsp4_core_release(struct cyttsp4_core *core)
 	return 0;
 }
 
-static struct cyttsp4_core_driver cyttsp4_core_driver = {
+struct cyttsp4_core_driver cyttsp4_core_driver = {
 	.probe = cyttsp4_core_probe,
 	.remove = cyttsp4_core_release,
 	.subscribe_attention = cyttsp4_subscribe_attention_,
@@ -4170,17 +2969,11 @@ static struct cyttsp4_core_driver cyttsp4_core_driver = {
 	.request_restart = cyttsp4_request_restart_,
 	.request_set_mode = cyttsp4_request_set_mode_,
 	.request_sysinfo = cyttsp4_request_sysinfo_,
-	.request_loader_pdata = cyttsp4_request_loader_pdata_,
 	.request_handshake = cyttsp4_request_handshake_,
 	.request_exec_cmd = cyttsp4_request_exec_cmd_,
 	.request_stop_wd = cyttsp4_request_stop_wd_,
 	.request_toggle_lowpower = cyttsp4_request_toggle_lowpower_,
-	.request_config_row_size = cyttsp4_request_config_row_size_,
-	.request_write_config = cyttsp4_request_write_config_,
-	.request_enable_scan_type = cyttsp4_request_enable_scan_type_,
-	.request_disable_scan_type = cyttsp4_request_disable_scan_type_,
-	.get_security_key = cyttsp4_get_security_key_,
-	.get_touch_record = cyttsp4_get_touch_record_,
+	.request_calibration = cyttsp4_request_calibration_,
 	.write = cyttsp4_write_,
 	.read = cyttsp4_read_,
 	.driver = {
@@ -4196,8 +2989,8 @@ static int __init cyttsp4_core_init(void)
 	int rc = 0;
 
 	rc = cyttsp4_register_core_driver(&cyttsp4_core_driver);
-	pr_info("%s: Cypress TTSP v4 core driver (Built %s) rc=%d\n",
-		 __func__, CY_DRIVER_DATE, rc);
+	pr_info("%s: Cypress TTSP v4 core driver (Built %s @ %s) rc=%d\n",
+		 __func__, __DATE__, __TIME__, rc);
 	return rc;
 }
 module_init(cyttsp4_core_init);
